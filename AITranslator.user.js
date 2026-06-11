@@ -1,5 +1,5 @@
 // ==UserScript==
-// @name         AI 캐릭터 맞춤 번역기 (모바일 및 테마 고정)
+// @name         AI 캐릭터 맞춤 번역기
 // @namespace    http://tampermonkey.net/
 // @version      2.8
 // @description  다크모드 영향 없이 하얀색 UI 고정 및 모바일 최적화
