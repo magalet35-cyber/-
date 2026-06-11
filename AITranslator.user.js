@@ -3,7 +3,7 @@
 // @namespace    http://tampermonkey.net/
 // @version      2.8
 // @description  다크모드 영향 없이 하얀색 UI 고정 및 모바일 최적화
-// @match        *://*/*
+// @match        https://crack.wrtn.ai/*
 // @grant        GM_addStyle
 // @grant        GM_setValue
 // @grant        GM_getValue
