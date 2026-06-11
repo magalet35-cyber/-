@@ -1,9 +1,9 @@
 // ==UserScript==
-// @name         AI 캐릭터 맞춤 번역기 (모바일 최적화)
+// @name         AI 캐릭터 맞춤 번역기 (모바일 및 테마 고정)
 // @namespace    http://tampermonkey.net/
-// @version      2.7
-// @description  설정창 모바일 UI 최적화 (초소형 사이즈 및 터치 드래그 지원)
-// @match        https://crack.wrtn.ai/*
+// @version      2.8
+// @description  다크모드 영향 없이 하얀색 UI 고정 및 모바일 최적화
+// @match        *://*/*
 // @grant        GM_addStyle
 // @grant        GM_setValue
 // @grant        GM_getValue
@@ -29,7 +29,7 @@
             el.dispatchEvent(new Event("input", { bubbles: true }));
             return;
         }
-
+        
         const proto = el.tagName === "TEXTAREA" ? window.HTMLTextAreaElement.prototype : window.HTMLInputElement.prototype;
         const setter = Object.getOwnPropertyDescriptor(proto, "value")?.set;
         if (setter) {
@@ -37,10 +37,10 @@
         } else {
             el.value = value;
         }
-
+        
         el.dispatchEvent(new Event("input", { bubbles: true }));
         el.dispatchEvent(new Event("change", { bubbles: true }));
-
+        
         if(el.tagName === "TEXTAREA") {
             el.style.height = 'auto';
             el.style.height = el.scrollHeight + 'px';
@@ -59,33 +59,33 @@
             box-shadow:0 4px 16px rgba(0,0,0,.4); transition:opacity .4s; white-space:nowrap;
         `;
         document.body.appendChild(el);
-        setTimeout(() => { el.style.opacity="0"; setTimeout(()=>el.remove(),400); }, 3000);
+        setTimeout(() => { el.style.opacity="0"; setTimeout(()=>el.remove(),400); }, 3000); 
     }
 
     // ===================================================================================
-    // [스타일 정의 - 모바일 최적화 (초소형 컴팩트 버전)]
+    // [스타일 정의 - 사이트 변수(var) 제거 및 화이트 테마 강제 고정]
     // ===================================================================================
     GM_addStyle(`
         #ai-trans-inline-group { display: flex; align-items: center; gap: 4px; margin-left: auto; margin-right: 6px; }
-        .trans-action-btn {
-            height: 1.8rem; border-radius: 6px; background: #6A3DE8; color: white; border: none;
-            padding: 0 10px; font-size: 12px; font-weight: bold; cursor: pointer; transition: 0.2s;
+        .trans-action-btn { 
+            height: 1.8rem; border-radius: 6px; background: #6A3DE8; color: white; border: none; 
+            padding: 0 10px; font-size: 12px; font-weight: bold; cursor: pointer; transition: 0.2s; 
             display: flex; align-items: center; gap: 4px; box-shadow: 0 2px 5px rgba(0,0,0,0.2);
         }
         .trans-action-btn:hover { background: #5228CC; transform: translateY(-1px); }
         .trans-action-btn:disabled { background: #9ca3af; cursor: not-allowed; transform: none; }
-
+        
         .trans-setting-btn {
-            height: 1.8rem; width: 1.8rem; border-radius: 6px; background: transparent; color: var(--text_secondary, #666);
-            border: 1px solid var(--border, #ccc); padding: 0; font-size: 12px; cursor: pointer; transition: 0.2s; display: flex; justify-content: center; align-items: center;
+            height: 1.8rem; width: 1.8rem; border-radius: 6px; background: #ffffff; color: #666666;
+            border: 1px solid #cccccc; padding: 0; font-size: 12px; cursor: pointer; transition: 0.2s; display: flex; justify-content: center; align-items: center;
         }
-        .trans-setting-btn:hover { background: var(--bg_elevated_secondary, #f0f0f0); color: #333; }
+        .trans-setting-btn:hover { background: #f0f0f0; color: #333333; }
 
-        /* 패널 UI를 모바일에 맞게 초소형으로 조정 */
-        #ai-trans-panel {
-            position: fixed; top: 10vh; left: 5vw; z-index: 999999;
-            width: 90vw; max-width: 320px; /* 모바일 화면에 쏙 들어가는 사이즈 */
-            background: var(--bg_screen, #fff); border: 1px solid var(--border, #ddd);
+        /* 패널 UI를 모바일에 맞게 초소형으로 조정 + 화이트 고정 */
+        #ai-trans-panel { 
+            position: fixed; top: 10vh; left: 5vw; z-index: 999999; 
+            width: 90vw; max-width: 320px; 
+            background: #ffffff; border: 1px solid #dddddd; color: #333333;
             border-radius: 10px; box-shadow: 0 10px 30px rgba(0,0,0,0.3); display: none; flex-direction: column; overflow: hidden;
             font-family: system-ui, -apple-system, sans-serif;
         }
@@ -93,26 +93,31 @@
         .ai-panel-close { cursor: pointer; color: #f87171; padding: 0 5px; }
         .ai-tabs { display: flex; background: #f3f4f6; border-bottom: 1px solid #e5e7eb; }
         .ai-tab { flex: 1; padding: 8px 0; text-align: center; cursor: pointer; font-size: 12px; color: #4b5563; }
-        .ai-tab.active { background: #fff; color: #6A3DE8; font-weight: bold; border-bottom: 2px solid #6A3DE8; }
-
-        .ai-content { padding: 12px; display: none; max-height: 60vh; overflow-y: auto; }
+        .ai-tab.active { background: #ffffff; color: #6A3DE8; font-weight: bold; border-bottom: 2px solid #6A3DE8; }
+        
+        .ai-content { padding: 12px; display: none; max-height: 60vh; overflow-y: auto; background: #ffffff; }
         .ai-content::-webkit-scrollbar { width: 4px; }
-        .ai-content::-webkit-scrollbar-thumb { background: #ccc; border-radius: 4px; }
+        .ai-content::-webkit-scrollbar-thumb { background: #cccccc; border-radius: 4px; }
         .ai-content.active { display: block; }
-
+        
         .ai-form-group { margin-bottom: 8px; }
         .ai-form-group label { display: block; font-size: 11px; margin-bottom: 3px; font-weight: bold; color: #374151; }
-        .ai-input { width: 100%; padding: 6px; border: 1px solid #d1d5db; border-radius: 4px; box-sizing: border-box; font-size: 12px; outline: none; }
+        /* 입력칸 화이트 고정 */
+        .ai-input { 
+            width: 100%; padding: 6px; background: #ffffff; color: #333333; 
+            border: 1px solid #d1d5db; border-radius: 4px; box-sizing: border-box; font-size: 12px; outline: none; 
+        }
         .ai-input:focus { border-color: #6A3DE8; }
         textarea.ai-input { resize: vertical; min-height: 50px; }
-
+        
         .ai-btn-full { width: 100%; background: #6A3DE8; color: white; border: none; padding: 8px; border-radius: 4px; cursor: pointer; font-weight: bold; margin-top: 5px; font-size: 12px;}
         .ai-btn-full:hover { background: #5228CC; }
-
-        .char-item { background: #f9fafb; border: 1px solid #e5e7eb; padding: 6px 8px; margin-bottom: 4px; border-radius: 4px; display: flex; justify-content: space-between; font-size: 12px; cursor: pointer; align-items: center; }
+        
+        /* 리스트 아이템 화이트 고정 */
+        .char-item { background: #f9fafb; color: #333333; border: 1px solid #e5e7eb; padding: 6px 8px; margin-bottom: 4px; border-radius: 4px; display: flex; justify-content: space-between; font-size: 12px; cursor: pointer; align-items: center; }
         .char-item:hover { border-color: #6A3DE8; }
         .char-del { color: #ef4444; font-weight: bold; padding: 0 4px; }
-
+        
         @keyframes spin { 100% { transform: rotate(360deg); } }
         .spin-icon { display: inline-block; animation: spin 1s linear infinite; }
     `);
@@ -139,7 +144,7 @@
                     <div class="ai-tab active" data-target="tab-main">기본 설정</div>
                     <div class="ai-tab" data-target="tab-chars">캐릭터 보관함</div>
                 </div>
-
+                
                 <div class="ai-content active" id="tab-main">
                     <div class="ai-form-group">
                         <label>적용할 캐릭터</label>
@@ -183,19 +188,18 @@
                     <div class="ai-form-group"><label>직업/국적</label><input type="text" id="ch-job" class="ai-input"></div>
                     <div class="ai-form-group"><label>특징/말투</label><textarea id="ch-traits" class="ai-input" placeholder="까칠함, 존댓말 등"></textarea></div>
                     <button class="ai-btn-full" id="btn-save-char">캐릭터 저장</button>
-                    <div style="border-top:1px solid #ddd; margin:12px 0 8px;"></div>
+                    <div style="border-top:1px solid #dddddd; margin:12px 0 8px;"></div>
                     <label style="font-size:11px; font-weight:bold;">저장된 목록</label>
                     <div id="char-list-box" style="margin-top:4px;"></div>
                 </div>
             `;
             document.body.appendChild(panel);
-
-            // 모바일 터치 + PC 마우스 드래그 지원
+            
             const dragHandle = document.getElementById('ai-panel-drag');
             let isDragging = false, startX, startY, initLeft, initTop;
-
+            
             const dragStart = (e) => {
-                isDragging = true;
+                isDragging = true; 
                 const evt = e.touches ? e.touches[0] : e;
                 startX = evt.clientX; startY = evt.clientY;
                 const rect = panel.getBoundingClientRect();
@@ -203,8 +207,7 @@
             };
             const dragMove = (e) => {
                 if (!isDragging) return;
-                // 모바일에서 드래그 시 화면 넘어가는 현상 방지
-                e.preventDefault();
+                e.preventDefault(); 
                 const evt = e.touches ? e.touches[0] : e;
                 panel.style.left = Math.max(0, initLeft + (evt.clientX - startX)) + 'px';
                 panel.style.top = Math.max(0, initTop + (evt.clientY - startY)) + 'px';
@@ -212,12 +215,10 @@
             };
             const dragEnd = () => isDragging = false;
 
-            // 마우스 이벤트
             dragHandle.addEventListener('mousedown', dragStart);
             document.addEventListener('mousemove', dragMove, { passive: false });
             document.addEventListener('mouseup', dragEnd);
-
-            // 터치 이벤트
+            
             dragHandle.addEventListener('touchstart', dragStart, { passive: true });
             document.addEventListener('touchmove', dragMove, { passive: false });
             document.addEventListener('touchend', dragEnd);
@@ -266,16 +267,16 @@
         renderCharList() {
             const box = document.getElementById('char-list-box');
             const select = document.getElementById('cfg-char');
-            box.innerHTML = '';
+            box.innerHTML = ''; 
             select.innerHTML = '<option value="">선택 안 함 (일반 번역)</option>';
 
             Object.keys(characters).forEach(name => {
                 select.innerHTML += `<option value="${name}">${name}</option>`;
-
+                
                 const item = document.createElement('div');
                 item.className = 'char-item';
                 item.innerHTML = `<span>${name}</span> <span class="char-del" data-name="${name}">✕</span>`;
-
+                
                 item.onclick = (e) => {
                     if (e.target.classList.contains('char-del')) {
                         if(confirm(`'${name}' 삭제할까요?`)) {
@@ -303,18 +304,18 @@
     // [번역 API 호출]
     // ===================================================================================
     function getChatInput() {
-        return document.querySelector('.__chat_input_textarea') ||
-               document.querySelector('div[contenteditable="true"]') ||
+        return document.querySelector('.__chat_input_textarea') || 
+               document.querySelector('div[contenteditable="true"]') || 
                document.querySelector('textarea');
     }
 
     async function executeTranslation() {
         const inputEl = getChatInput();
         if (!inputEl) return toast('입력창을 찾을 수 없음', 'error');
-
+        
         const isEditableDiv = inputEl.isContentEditable;
         const rawText = isEditableDiv ? inputEl.innerText : inputEl.value;
-
+        
         if (!rawText || !rawText.trim()) return toast('번역할 텍스트를 입력하세요', 'warn');
         if (!settings.apiKey) return toast('설정창에서 API 키 입력 필요', 'error');
 
@@ -332,7 +333,7 @@ Rules:
 3. 🚨CRITICAL: ALWAYS append the original Korean dialogue in parentheses right after the translated dialogue.
 Example Input: **손을 흔들며** 안녕, 반가워!
 Example Output: **손을 흔들며** Hello, nice to meet you! (안녕, 반가워!)`;
-
+        
         if (settings.activeChar && characters[settings.activeChar]) {
             const c = characters[settings.activeChar];
             sysPrompt += `\n4. Apply Character Persona to the dialogue translation: Name:${settings.activeChar}, Age:${c.age}, Gender:${c.gender}, Job:${c.job}, Traits:${c.traits}`;
@@ -358,7 +359,7 @@ Example Output: **손을 흔들며** Hello, nice to meet you! (안녕, 반가워
                 btn.disabled = false;
                 icon.innerText = '🌐';
                 icon.classList.remove('spin-icon');
-
+                
                 try {
                     const data = JSON.parse(res.responseText);
 
@@ -368,11 +369,11 @@ Example Output: **손을 흔들며** Hello, nice to meet you! (안녕, 반가워
 
                     if (data.candidates && data.candidates.length > 0) {
                         const cand = data.candidates[0];
-
+                        
                         if (cand.finishReason === "SAFETY") {
                             throw new Error("안전 필터 차단됨");
                         }
-
+                        
                         if (!cand.content || !cand.content.parts || cand.content.parts.length === 0) {
                             throw new Error("빈 텍스트 반환됨");
                         }
@@ -380,17 +381,17 @@ Example Output: **손을 흔들며** Hello, nice to meet you! (안녕, 반가워
                         const translated = cand.content.parts[0].text.trim();
                         setReactValue(inputEl, translated);
                         toast('번역 완료!', 'success');
-
+                        
                     } else if (data.error) {
                         throw new Error(`${data.error.message}`);
                     } else {
                         throw new Error("결과값 없음");
                     }
-                } catch (e) {
+                } catch (e) { 
                     if (e instanceof SyntaxError) {
                         toast('모델명/키 오류', 'error');
                     } else {
-                        toast(`에러: ${e.message}`, 'error');
+                        toast(`에러: ${e.message}`, 'error'); 
                     }
                 }
             },
@@ -427,12 +428,12 @@ Example Output: **손을 흔들며** Hello, nice to meet you! (안녕, 반가워
         if (!wrapper || !wrapper.isConnected) {
             wrapper = document.createElement('div');
             wrapper.id = 'ai-trans-inline-group';
-
+            
             wrapper.innerHTML = `
                 <button id="ai-trans-btn" class="trans-action-btn" title="캐릭터 번역"><span id="trans-icon">🌐</span> 번역</button>
                 <button id="ai-trans-cfg-btn" class="trans-setting-btn" title="설정">⚙️</button>
             `;
-
+            
             container.insertBefore(wrapper, container.firstChild);
 
             wrapper.querySelector('#ai-trans-btn').onclick = executeTranslation;
