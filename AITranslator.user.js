@@ -1,8 +1,8 @@
 // ==UserScript==
 // @name         AI 캐릭터 맞춤 번역기
 // @namespace    http://tampermonkey.net/
-// @version      3.1
-// @description  맥락 번역 확인용 콘솔 로그 출력 기능 추가
+// @version      3.2
+// @description  직전 대화 맥락 인식 및 콘솔 디버깅 강화
 // @match        https://crack.wrtn.ai/*
 // @grant        GM_addStyle
 // @grant        GM_setValue
@@ -138,7 +138,7 @@
             panel.id = 'ai-trans-panel';
             panel.innerHTML = `
                 <div class="ai-panel-header" id="ai-panel-drag">
-                    <span>⚙️ 번역 설정 (V3.1)</span>
+                    <span>⚙️ 번역 설정 (V3.2)</span>
                     <span class="ai-panel-close" id="ai-panel-close">✕</span>
                 </div>
                 <div class="ai-tabs">
@@ -291,6 +291,7 @@
                 settings.useContext = document.getElementById('cfg-context').checked; 
                 saveSettings();
                 toast('기본 설정 저장됨', 'success');
+                console.log("⚙️ [AI 번역기] 설정이 저장되었습니다. 맥락 사용 여부:", settings.useContext);
             };
 
             document.getElementById('btn-save-char').onclick = () => {
@@ -353,26 +354,39 @@
                document.querySelector('textarea');
     }
 
-    // 직전 대화 맥락 가져오기
     async function getRecentContext() {
+        console.log("🔍 [AI 번역기] 맥락 추출 시도 중...");
         const path = location.pathname.match(/\/stories\/([^/]+)\/episodes\/([^/]+)/);
+        
         if (!path) {
-            const bubbles = Array.from(document.querySelectorAll('.whitespace-pre-wrap')).slice(-4);
-            return bubbles.map(b => b.textContent.trim()).filter(Boolean).join('\n\n');
+            console.log("⚠️ [AI 번역기] URL 형식이 API 추출과 다릅니다. 화면(DOM)에서 직접 글자를 긁어옵니다.");
+            const bubbles = Array.from(document.querySelectorAll('div[dir="auto"], .whitespace-pre-wrap, p')).slice(-6);
+            const domContext = bubbles.map(b => b.textContent.trim()).filter(Boolean).join('\n\n');
+            if (domContext) {
+                console.log("✅ [AI 번역기] 화면(DOM)에서 맥락 추출 성공!");
+            }
+            return domContext;
         }
         
         try {
             const token = document.cookie.split(";").map((c) => c.trim()).find((c) => c.startsWith("access_token="))?.slice(13);
-            if (!token) return "";
+            if (!token) {
+                console.log("❌ [AI 번역기] 권한 토큰을 찾을 수 없습니다.");
+                return "";
+            }
             
+            console.log("🌐 [AI 번역기] 사이트 내부 API를 통해 대화 기록을 요청합니다...");
             const res = await fetch(`https://crack-api.wrtn.ai/crack-gen/v3/chats/${path[2]}/messages?limit=4`, {
                 headers: { Authorization: `Bearer ${token}`, "Content-Type": "application/json" }
             });
             const json = await res.json();
             const msgs = (json.data ?? json).messages ?? [];
             
-            return msgs.reverse().map(m => `[${m.role === "assistant" ? "상대방" : "나"}]: ${m.content}`).join("\n\n");
+            const apiContext = msgs.reverse().map(m => `[${m.role === "assistant" ? "상대방" : "나"}]: ${m.content}`).join("\n\n");
+            console.log("✅ [AI 번역기] API에서 맥락 추출 성공!");
+            return apiContext;
         } catch(e) {
+            console.error("❌ [AI 번역기] 맥락 추출 중 에러 발생:", e);
             return "";
         }
     }
@@ -398,6 +412,9 @@
     }
 
     async function executeTranslation() {
+        console.log("======================================");
+        console.log("🚀 [AI 번역기] 번역 프로세스 시작");
+        
         const inputEl = getChatInput();
         if (!inputEl) return toast('입력창을 찾을 수 없음', 'error');
 
@@ -415,18 +432,20 @@
         icon.classList.add('spin-icon');
         toast('번역 준비 중...', 'info');
 
-        // 🔥 맥락 가져오기 로직 및 콘솔 로그 출력 추가
+        console.log(`📌 현재 설정 - API: ${settings.provider}, 모델: ${settings.model}, 맥락사용여부: ${settings.useContext}`);
+
         let contextText = "";
         if (settings.useContext) {
             toast('대화 맥락 읽는 중...', 'info');
             contextText = await getRecentContext();
             
-            // 개발자 도구(F12) 콘솔창에 가져온 맥락 출력
             if (contextText) {
-                console.log("🧠 [AI 번역기] 성공적으로 읽어온 직전 대화 맥락:\\n", contextText);
+                console.log("🧠 [AI 번역기] 최종적으로 읽어온 맥락 데이터:\n\n", contextText);
             } else {
-                console.log("⚠️ [AI 번역기] 맥락을 읽어오지 못했습니다. 기본 번역으로 진행합니다.");
+                console.log("⚠️ [AI 번역기] 맥락 데이터를 비어있는 상태로 번역을 진행합니다.");
             }
+        } else {
+            console.log("⛔ [AI 번역기] 설정에서 맥락 사용이 꺼져있어 읽기를 건너뜁니다.");
         }
 
         let sysPrompt = `Translate the roleplay text to ${settings.lang}.\n`;
@@ -442,10 +461,13 @@
             sysPrompt += `\n4. Apply Character Persona to the dialogue translation: Name:${settings.activeChar}, Age:${c.age}, Gender:${c.gender}, Job:${c.job}, Traits:${c.traits}`;
         }
 
+        console.log("📝 [AI 번역기] AI에게 전송할 프롬프트 조합 완료");
+
         try {
             let translatedText = "";
 
             if (settings.provider === 'firebase') {
+                console.log("🔥 [AI 번역기] Firebase Vertex AI로 요청 전송 중...");
                 const config = parseVertexContent(settings.firebaseConfig);
                 if (!config) throw new Error("Firebase 스크립트 형식이 올바르지 않습니다.");
 
@@ -476,8 +498,10 @@
                 const result = await model.generateContent(rawText);
                 const response = await result.response;
                 translatedText = response.text().trim();
+                console.log("✅ [AI 번역기] Firebase 응답 성공!");
 
             } else {
+                console.log("☁️ [AI 번역기] Google API로 요청 전송 중...");
                 const payloadData = {
                     system_instruction: { parts: [{ text: sysPrompt }] },
                     contents: [{ parts: [{ text: rawText }] }],
@@ -503,6 +527,7 @@
                                     const cand = data.candidates[0];
                                     if (cand.finishReason === "SAFETY") throw new Error("안전 필터 차단됨");
                                     if (!cand.content || !cand.content.parts || cand.content.parts.length === 0) throw new Error("빈 텍스트 반환됨");
+                                    console.log("✅ [AI 번역기] Google API 응답 성공!");
                                     resolve(cand.content.parts[0].text.trim());
                                 } else if (data.error) {
                                     throw new Error(`${data.error.message}`);
@@ -519,15 +544,18 @@
                 });
             }
 
+            console.log("결과 텍스트:\n", translatedText);
             setReactValue(inputEl, translatedText);
             toast('번역 완료!', 'success');
 
         } catch (error) {
+            console.error("❌ [AI 번역기] 에러 발생:", error);
             toast(`에러: ${error.message}`, 'error');
         } finally {
             btn.disabled = false;
             icon.innerText = '🌐';
             icon.classList.remove('spin-icon');
+            console.log("======================================");
         }
     }
 
