@@ -1,8 +1,8 @@
 // ==UserScript==
 // @name         AI 캐릭터 맞춤 번역기
 // @namespace    http://tampermonkey.net/
-// @version      3.0
-// @description  직전 대화 맥락(Context) 인식 번역 및 Firebase/Google API 통합 지원
+// @version      3.1
+// @description  맥락 번역 확인용 콘솔 로그 출력 기능 추가
 // @match        https://crack.wrtn.ai/*
 // @grant        GM_addStyle
 // @grant        GM_setValue
@@ -21,7 +21,6 @@
     let characters = JSON.parse(GM_getValue('AITrans_chars', '{}'));
     let settings = JSON.parse(GM_getValue('AITrans_settings', '{"provider":"google","apiKey":"","firebaseConfig":"","model":"gemini-3.5-flash","lang":"English","activeChar":"","useContext":true}'));
     
-    // 이전 버전에서 업데이트 시 useContext가 없으면 기본값 true 설정
     if (settings.useContext === undefined) settings.useContext = true;
 
     function saveSettings() { GM_setValue('AITrans_settings', JSON.stringify(settings)); }
@@ -139,7 +138,7 @@
             panel.id = 'ai-trans-panel';
             panel.innerHTML = `
                 <div class="ai-panel-header" id="ai-panel-drag">
-                    <span>⚙️ 번역 설정 (V3.0)</span>
+                    <span>⚙️ 번역 설정 (V3.1)</span>
                     <span class="ai-panel-close" id="ai-panel-close">✕</span>
                 </div>
                 <div class="ai-tabs">
@@ -172,7 +171,6 @@
                         </div>
                     </div>
 
-                    <!-- 🔥 추가된 기능: 직전 대화(맥락) 읽기 토글 -->
                     <div class="ai-form-group" style="background: #f8fafc; padding: 6px; border-radius: 4px; border: 1px solid #e2e8f0; margin-top: 4px;">
                         <label style="margin: 0; color: #6A3DE8;">
                             <input type="checkbox" id="cfg-context" style="margin: 0;"> 🧠 직전 대화(맥락) 읽고 뉘앙스 반영하기
@@ -269,7 +267,7 @@
             document.getElementById('cfg-firebase').value = settings.firebaseConfig || '';
             document.getElementById('cfg-model').value = settings.model || 'gemini-3.5-flash';
             document.getElementById('cfg-lang').value = settings.lang || 'English';
-            document.getElementById('cfg-context').checked = settings.useContext; // 맥락 체크박스 로드
+            document.getElementById('cfg-context').checked = settings.useContext; 
 
             const toggleProviderUI = () => {
                 if (selProvider.value === 'google') {
@@ -290,7 +288,7 @@
                 settings.model = document.getElementById('cfg-model').value;
                 settings.lang = document.getElementById('cfg-lang').value;
                 settings.activeChar = document.getElementById('cfg-char').value;
-                settings.useContext = document.getElementById('cfg-context').checked; // 맥락 체크박스 저장
+                settings.useContext = document.getElementById('cfg-context').checked; 
                 saveSettings();
                 toast('기본 설정 저장됨', 'success');
             };
@@ -355,11 +353,10 @@
                document.querySelector('textarea');
     }
 
-    // 🔥 추가된 기능: 직전 대화 맥락 가져오기
+    // 직전 대화 맥락 가져오기
     async function getRecentContext() {
         const path = location.pathname.match(/\/stories\/([^/]+)\/episodes\/([^/]+)/);
         if (!path) {
-            // Wrtn API를 못 쓸 경우 DOM을 긁어서 대략적으로 가져오는 안전장치
             const bubbles = Array.from(document.querySelectorAll('.whitespace-pre-wrap')).slice(-4);
             return bubbles.map(b => b.textContent.trim()).filter(Boolean).join('\n\n');
         }
@@ -368,14 +365,12 @@
             const token = document.cookie.split(";").map((c) => c.trim()).find((c) => c.startsWith("access_token="))?.slice(13);
             if (!token) return "";
             
-            // 직전 대화 4개(limit=4)를 가져옴
             const res = await fetch(`https://crack-api.wrtn.ai/crack-gen/v3/chats/${path[2]}/messages?limit=4`, {
                 headers: { Authorization: `Bearer ${token}`, "Content-Type": "application/json" }
             });
             const json = await res.json();
             const msgs = (json.data ?? json).messages ?? [];
             
-            // 대화를 합쳐서 누가 말했는지 표시 후 반환
             return msgs.reverse().map(m => `[${m.role === "assistant" ? "상대방" : "나"}]: ${m.content}`).join("\n\n");
         } catch(e) {
             return "";
@@ -420,16 +415,22 @@
         icon.classList.add('spin-icon');
         toast('번역 준비 중...', 'info');
 
-        // 🔥 맥락 가져오기 로직 추가
+        // 🔥 맥락 가져오기 로직 및 콘솔 로그 출력 추가
         let contextText = "";
         if (settings.useContext) {
             toast('대화 맥락 읽는 중...', 'info');
             contextText = await getRecentContext();
+            
+            // 개발자 도구(F12) 콘솔창에 가져온 맥락 출력
+            if (contextText) {
+                console.log("🧠 [AI 번역기] 성공적으로 읽어온 직전 대화 맥락:\\n", contextText);
+            } else {
+                console.log("⚠️ [AI 번역기] 맥락을 읽어오지 못했습니다. 기본 번역으로 진행합니다.");
+            }
         }
 
         let sysPrompt = `Translate the roleplay text to ${settings.lang}.\n`;
         
-        // 뇌 역할: 맥락 데이터 주입
         if (contextText) {
             sysPrompt += `\n[Recent Conversation Context]\n${contextText}\n\n*CRITICAL: Use the above context ONLY to understand the situation, tone, and relationships. DO NOT translate the context itself.*\n\n`;
         }
