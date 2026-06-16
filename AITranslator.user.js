@@ -1,8 +1,8 @@
 // ==UserScript==
 // @name         AI 캐릭터 맞춤 번역기
 // @namespace    http://tampermonkey.net/
-// @version      3.4
-// @description  별표 1개/2개 모두 인식 및 윤문(Polish) 프롬프트 강력 강화
+// @version      3.2
+// @description  직전 대화 맥락 인식 및 콘솔 디버깅 강화
 // @match        https://crack.wrtn.ai/*
 // @grant        GM_addStyle
 // @grant        GM_setValue
@@ -19,10 +19,9 @@
     // [상태 관리]
     // ===================================================================================
     let characters = JSON.parse(GM_getValue('AITrans_chars', '{}'));
-    let settings = JSON.parse(GM_getValue('AITrans_settings', '{"provider":"google","apiKey":"","firebaseConfig":"","model":"gemini-3.5-flash","lang":"English","activeChar":"","useContext":true,"usePolish":false}'));
+    let settings = JSON.parse(GM_getValue('AITrans_settings', '{"provider":"google","apiKey":"","firebaseConfig":"","model":"gemini-3.5-flash","lang":"English","activeChar":"","useContext":true}'));
     
     if (settings.useContext === undefined) settings.useContext = true;
-    if (settings.usePolish === undefined) settings.usePolish = false;
 
     function saveSettings() { GM_setValue('AITrans_settings', JSON.stringify(settings)); }
     function saveChars() { GM_setValue('AITrans_chars', JSON.stringify(characters)); }
@@ -104,7 +103,7 @@
         .ai-content.active { display: block; }
 
         .ai-form-group { margin-bottom: 8px; }
-        .ai-form-group label.toggle-label { display: flex; align-items: center; gap: 4px; font-size: 11px; margin-bottom: 3px; font-weight: bold; cursor: pointer; }
+        .ai-form-group label { display: flex; align-items: center; gap: 4px; font-size: 11px; margin-bottom: 3px; font-weight: bold; color: #374151; cursor: pointer; }
         .ai-input {
             width: 100%; padding: 6px; background: #ffffff; color: #333333;
             border: 1px solid #d1d5db; border-radius: 4px; box-sizing: border-box; font-size: 12px; outline: none;
@@ -139,7 +138,7 @@
             panel.id = 'ai-trans-panel';
             panel.innerHTML = `
                 <div class="ai-panel-header" id="ai-panel-drag">
-                    <span>⚙️ 번역 설정 (V3.4)</span>
+                    <span>⚙️ 번역 설정 (V3.2)</span>
                     <span class="ai-panel-close" id="ai-panel-close">✕</span>
                 </div>
                 <div class="ai-tabs">
@@ -149,12 +148,12 @@
 
                 <div class="ai-content active" id="tab-main">
                     <div class="ai-form-group">
-                        <label style="font-size: 11px; font-weight: bold; margin-bottom: 3px;">적용할 캐릭터</label>
+                        <label>적용할 캐릭터</label>
                         <select id="cfg-char" class="ai-input"><option value="">선택 안 함</option></select>
                     </div>
                     <div style="display:flex; gap:4px;">
                         <div class="ai-form-group" style="flex:1;">
-                            <label style="font-size: 11px; font-weight: bold; margin-bottom: 3px;">목표 언어</label>
+                            <label>목표 언어</label>
                             <select id="cfg-lang" class="ai-input">
                                 <option value="English">영어</option>
                                 <option value="Japanese">일본어</option>
@@ -163,7 +162,7 @@
                             </select>
                         </div>
                         <div class="ai-form-group" style="flex:1;">
-                            <label style="font-size: 11px; font-weight: bold; margin-bottom: 3px;">사용 모델</label>
+                            <label>사용 모델</label>
                             <select id="cfg-model" class="ai-input">
                                 <option value="gemini-3.5-flash">3.5 Flash</option>
                                 <option value="gemini-3.1-flash-lite-preview">3.1 Flash-Lite</option>
@@ -172,17 +171,14 @@
                         </div>
                     </div>
 
-                    <div class="ai-form-group" style="background: #f8fafc; padding: 8px 10px; border-radius: 6px; border: 1px solid #e2e8f0; margin-top: 4px; display: flex; flex-direction: column; gap: 8px;">
-                        <label class="toggle-label" style="color: #6A3DE8;">
-                            <input type="checkbox" id="cfg-context" style="margin: 0;"> 🧠 대화 맥락 읽고 뉘앙스 반영하기
-                        </label>
-                        <label class="toggle-label" style="color: #f97316;">
-                            <input type="checkbox" id="cfg-polish" style="margin: 0;"> ✍️ 번역 전 서술(* 또는 **) 화려하게 윤문하기
+                    <div class="ai-form-group" style="background: #f8fafc; padding: 6px; border-radius: 4px; border: 1px solid #e2e8f0; margin-top: 4px;">
+                        <label style="margin: 0; color: #6A3DE8;">
+                            <input type="checkbox" id="cfg-context" style="margin: 0;"> 🧠 직전 대화(맥락) 읽고 뉘앙스 반영하기
                         </label>
                     </div>
 
                     <div class="ai-form-group" style="margin-top: 8px;">
-                        <label style="font-size: 11px; font-weight: bold; margin-bottom: 3px;">API 제공자</label>
+                        <label>API 제공자</label>
                         <select id="cfg-provider" class="ai-input">
                             <option value="google">Google API</option>
                             <option value="firebase">Firebase Vertex AI</option>
@@ -190,29 +186,29 @@
                     </div>
 
                     <div class="ai-form-group" id="group-api-key">
-                        <label style="font-size: 11px; font-weight: bold; margin-bottom: 3px;">API 키</label>
+                        <label>API 키</label>
                         <input type="password" id="cfg-key" class="ai-input" placeholder="Google API Key 입력">
                     </div>
 
                     <div class="ai-form-group" id="group-firebase" style="display:none;">
-                        <label style="font-size: 11px; font-weight: bold; margin-bottom: 3px;">Firebase 설정</label>
+                        <label>Firebase 설정</label>
                         <textarea id="cfg-firebase" class="ai-input" placeholder="firebaseConfig = { ... }; 형식의 스크립트 입력"></textarea>
                     </div>
 
                     <button class="ai-btn-full" id="btn-save-cfg">설정 저장</button>
                     <div style="margin-top:10px; font-size:10px; color:#666; line-height:1.3; text-align:center;">
-                        * <b>*서술* 대사</b> ➡️ <b>*화려한 서술* 번역 (한국어원문)</b>
+                        * <b>**서술** 대사</b> ➡️ <b>**서술** 번역 (한국어원문)</b> 형태로 적용됨
                     </div>
                 </div>
 
                 <div class="ai-content" id="tab-chars">
-                    <div class="ai-form-group"><label style="font-size: 11px; font-weight: bold; margin-bottom: 3px;">이름</label><input type="text" id="ch-name" class="ai-input" placeholder="캐릭터 이름"></div>
+                    <div class="ai-form-group"><label>이름</label><input type="text" id="ch-name" class="ai-input" placeholder="캐릭터 이름"></div>
                     <div style="display:flex; gap:4px;">
-                        <div class="ai-form-group" style="flex:1;"><label style="font-size: 11px; font-weight: bold; margin-bottom: 3px;">나이</label><input type="text" id="ch-age" class="ai-input"></div>
-                        <div class="ai-form-group" style="flex:1;"><label style="font-size: 11px; font-weight: bold; margin-bottom: 3px;">성별</label><input type="text" id="ch-gender" class="ai-input"></div>
+                        <div class="ai-form-group" style="flex:1;"><label>나이</label><input type="text" id="ch-age" class="ai-input"></div>
+                        <div class="ai-form-group" style="flex:1;"><label>성별</label><input type="text" id="ch-gender" class="ai-input"></div>
                     </div>
-                    <div class="ai-form-group"><label style="font-size: 11px; font-weight: bold; margin-bottom: 3px;">직업/국적</label><input type="text" id="ch-job" class="ai-input"></div>
-                    <div class="ai-form-group"><label style="font-size: 11px; font-weight: bold; margin-bottom: 3px;">특징/말투</label><textarea id="ch-traits" class="ai-input" placeholder="까칠함, 존댓말 등"></textarea></div>
+                    <div class="ai-form-group"><label>직업/국적</label><input type="text" id="ch-job" class="ai-input"></div>
+                    <div class="ai-form-group"><label>특징/말투</label><textarea id="ch-traits" class="ai-input" placeholder="까칠함, 존댓말 등"></textarea></div>
                     <button class="ai-btn-full" id="btn-save-char">캐릭터 저장</button>
                     <div style="border-top:1px solid #dddddd; margin:12px 0 8px;"></div>
                     <label style="font-size:11px; font-weight:bold;">저장된 목록</label>
@@ -272,7 +268,6 @@
             document.getElementById('cfg-model').value = settings.model || 'gemini-3.5-flash';
             document.getElementById('cfg-lang').value = settings.lang || 'English';
             document.getElementById('cfg-context').checked = settings.useContext; 
-            document.getElementById('cfg-polish').checked = settings.usePolish; 
 
             const toggleProviderUI = () => {
                 if (selProvider.value === 'google') {
@@ -294,9 +289,9 @@
                 settings.lang = document.getElementById('cfg-lang').value;
                 settings.activeChar = document.getElementById('cfg-char').value;
                 settings.useContext = document.getElementById('cfg-context').checked; 
-                settings.usePolish = document.getElementById('cfg-polish').checked; 
                 saveSettings();
                 toast('기본 설정 저장됨', 'success');
+                console.log("⚙️ [AI 번역기] 설정이 저장되었습니다. 맥락 사용 여부:", settings.useContext);
             };
 
             document.getElementById('btn-save-char').onclick = () => {
@@ -360,25 +355,38 @@
     }
 
     async function getRecentContext() {
+        console.log("🔍 [AI 번역기] 맥락 추출 시도 중...");
         const path = location.pathname.match(/\/stories\/([^/]+)\/episodes\/([^/]+)/);
         
         if (!path) {
+            console.log("⚠️ [AI 번역기] URL 형식이 API 추출과 다릅니다. 화면(DOM)에서 직접 글자를 긁어옵니다.");
             const bubbles = Array.from(document.querySelectorAll('div[dir="auto"], .whitespace-pre-wrap, p')).slice(-6);
-            return bubbles.map(b => b.textContent.trim()).filter(Boolean).join('\n\n');
+            const domContext = bubbles.map(b => b.textContent.trim()).filter(Boolean).join('\n\n');
+            if (domContext) {
+                console.log("✅ [AI 번역기] 화면(DOM)에서 맥락 추출 성공!");
+            }
+            return domContext;
         }
         
         try {
             const token = document.cookie.split(";").map((c) => c.trim()).find((c) => c.startsWith("access_token="))?.slice(13);
-            if (!token) return "";
+            if (!token) {
+                console.log("❌ [AI 번역기] 권한 토큰을 찾을 수 없습니다.");
+                return "";
+            }
             
+            console.log("🌐 [AI 번역기] 사이트 내부 API를 통해 대화 기록을 요청합니다...");
             const res = await fetch(`https://crack-api.wrtn.ai/crack-gen/v3/chats/${path[2]}/messages?limit=4`, {
                 headers: { Authorization: `Bearer ${token}`, "Content-Type": "application/json" }
             });
             const json = await res.json();
             const msgs = (json.data ?? json).messages ?? [];
             
-            return msgs.reverse().map(m => `[${m.role === "assistant" ? "상대방" : "나"}]: ${m.content}`).join("\n\n");
+            const apiContext = msgs.reverse().map(m => `[${m.role === "assistant" ? "상대방" : "나"}]: ${m.content}`).join("\n\n");
+            console.log("✅ [AI 번역기] API에서 맥락 추출 성공!");
+            return apiContext;
         } catch(e) {
+            console.error("❌ [AI 번역기] 맥락 추출 중 에러 발생:", e);
             return "";
         }
     }
@@ -404,6 +412,9 @@
     }
 
     async function executeTranslation() {
+        console.log("======================================");
+        console.log("🚀 [AI 번역기] 번역 프로세스 시작");
+        
         const inputEl = getChatInput();
         if (!inputEl) return toast('입력창을 찾을 수 없음', 'error');
 
@@ -421,49 +432,42 @@
         icon.classList.add('spin-icon');
         toast('번역 준비 중...', 'info');
 
+        console.log(`📌 현재 설정 - API: ${settings.provider}, 모델: ${settings.model}, 맥락사용여부: ${settings.useContext}`);
+
         let contextText = "";
         if (settings.useContext) {
             toast('대화 맥락 읽는 중...', 'info');
             contextText = await getRecentContext();
+            
+            if (contextText) {
+                console.log("🧠 [AI 번역기] 최종적으로 읽어온 맥락 데이터:\n\n", contextText);
+            } else {
+                console.log("⚠️ [AI 번역기] 맥락 데이터를 비어있는 상태로 번역을 진행합니다.");
+            }
+        } else {
+            console.log("⛔ [AI 번역기] 설정에서 맥락 사용이 꺼져있어 읽기를 건너뜁니다.");
         }
 
-        // 🔥 프롬프트 전면 수정: * 와 ** 모두 인식하게 만들고 윤문 지시를 극강으로 올림
-        let sysPrompt = `You are a specialized RP translator and writer. Process the input text which consists of [NARRATIVE] and [DIALOGUE].\n`;
-        sysPrompt += `The [NARRATIVE] is any text wrapped in asterisks (either * or **).\n`;
-        sysPrompt += `The [DIALOGUE] is the spoken text outside the asterisks.\n\n`;
+        let sysPrompt = `Translate the roleplay text to ${settings.lang}.\n`;
         
         if (contextText) {
-            sysPrompt += `[Recent Conversation Context]\n${contextText}\n\n*CRITICAL: Use the context ONLY to understand the situation and tone. DO NOT translate the context.*\n\n`;
+            sysPrompt += `\n[Recent Conversation Context]\n${contextText}\n\n*CRITICAL: Use the above context ONLY to understand the situation, tone, and relationships. DO NOT translate the context itself.*\n\n`;
         }
 
-        sysPrompt += `[RULES]\n`;
-        
-        if (settings.usePolish) {
-            sysPrompt += `1. NARRATIVE: You MUST aggressively rewrite, expand, and polish the Korean [NARRATIVE] into a highly descriptive, emotional, and immersive web novel style in KOREAN. Even if the original narrative is already long, enhance its vocabulary and emotional depth like a professional author. NEVER translate the narrative to a foreign language. DO NOT just copy the original. Wrap the polished narrative in *.\n`;
-        } else {
-            sysPrompt += `1. NARRATIVE: DO NOT translate or modify the Korean [NARRATIVE]. Keep it EXACTLY as the original Korean text. Wrap it in *.\n`;
-        }
-
-        sysPrompt += `2. DIALOGUE: Translate the [DIALOGUE] to ${settings.lang}.\n`;
-        sysPrompt += `3. FORMAT: ALWAYS append the original Korean dialogue in parentheses right after the translated dialogue.\n\n`;
-
-        if (settings.usePolish) {
-            sysPrompt += `Example Input: *창밖을 보며* 안녕, 반가워!\n`;
-            sysPrompt += `Example Output: *유리창에 부딪히는 거센 빗방울을 물끄러미 응시하며, 쓸쓸한 눈빛으로 입을 열었다.* Hello, nice to meet you! (안녕, 반가워!)\n`;
-        } else {
-            sysPrompt += `Example Input: *창밖을 보며* 안녕, 반가워!\n`;
-            sysPrompt += `Example Output: *창밖을 보며* Hello, nice to meet you! (안녕, 반가워!)\n`;
-        }
+        sysPrompt += `[Rules]\n1. Ignore and DO NOT translate any narrative wrapped in ** (e.g. **He smiled.**). Keep it exactly as original Korean.\n2. Translate the spoken dialogue (text outside the **) to ${settings.lang}.\n3. 🚨CRITICAL: ALWAYS append the original Korean dialogue in parentheses right after the translated dialogue.\nExample Input: **손을 흔들며** 안녕, 반가워!\nExample Output: **손을 흔들며** Hello, nice to meet you! (안녕, 반가워!)`;
 
         if (settings.activeChar && characters[settings.activeChar]) {
             const c = characters[settings.activeChar];
-            sysPrompt += `\n[Character Persona for Dialogue Translation]\nName:${settings.activeChar}, Age:${c.age}, Gender:${c.gender}, Job:${c.job}, Traits:${c.traits}`;
+            sysPrompt += `\n4. Apply Character Persona to the dialogue translation: Name:${settings.activeChar}, Age:${c.age}, Gender:${c.gender}, Job:${c.job}, Traits:${c.traits}`;
         }
+
+        console.log("📝 [AI 번역기] AI에게 전송할 프롬프트 조합 완료");
 
         try {
             let translatedText = "";
 
             if (settings.provider === 'firebase') {
+                console.log("🔥 [AI 번역기] Firebase Vertex AI로 요청 전송 중...");
                 const config = parseVertexContent(settings.firebaseConfig);
                 if (!config) throw new Error("Firebase 스크립트 형식이 올바르지 않습니다.");
 
@@ -494,8 +498,10 @@
                 const result = await model.generateContent(rawText);
                 const response = await result.response;
                 translatedText = response.text().trim();
+                console.log("✅ [AI 번역기] Firebase 응답 성공!");
 
             } else {
+                console.log("☁️ [AI 번역기] Google API로 요청 전송 중...");
                 const payloadData = {
                     system_instruction: { parts: [{ text: sysPrompt }] },
                     contents: [{ parts: [{ text: rawText }] }],
@@ -521,6 +527,7 @@
                                     const cand = data.candidates[0];
                                     if (cand.finishReason === "SAFETY") throw new Error("안전 필터 차단됨");
                                     if (!cand.content || !cand.content.parts || cand.content.parts.length === 0) throw new Error("빈 텍스트 반환됨");
+                                    console.log("✅ [AI 번역기] Google API 응답 성공!");
                                     resolve(cand.content.parts[0].text.trim());
                                 } else if (data.error) {
                                     throw new Error(`${data.error.message}`);
@@ -537,15 +544,18 @@
                 });
             }
 
+            console.log("결과 텍스트:\n", translatedText);
             setReactValue(inputEl, translatedText);
             toast('번역 완료!', 'success');
 
         } catch (error) {
+            console.error("❌ [AI 번역기] 에러 발생:", error);
             toast(`에러: ${error.message}`, 'error');
         } finally {
             btn.disabled = false;
             icon.innerText = '🌐';
             icon.classList.remove('spin-icon');
+            console.log("======================================");
         }
     }
 
