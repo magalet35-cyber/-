@@ -1,5 +1,5 @@
 // ==UserScript==
-// @name         파이어 폭스 앱 전체화면 확프
+// @name        전체화면 확프
 // @namespace    http://tampermonkey.net/
 // @author       나 이뤼붕과 젬민이쉑
 // @version      2.0
