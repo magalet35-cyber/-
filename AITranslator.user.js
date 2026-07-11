@@ -1,14 +1,15 @@
 // ==UserScript==
 // @name         AI 캐릭터 맞춤 번역기
 // @namespace    http://tampermonkey.net/
-// @version      3.0
-// @description  출력 형식 커스텀 + 목표 언어 확장 + 다크/라이트 자동 테마 UI (Scene Painter 호환)
+// @version      3.5
+// @description  출력 커스텀 + 다국어 + 테마 자동전환 + 맥락/윤문 엔진 통합판
 // @match        https://crack.wrtn.ai/*
 // @grant        GM_addStyle
 // @grant        GM_setValue
 // @grant        GM_getValue
 // @grant        GM_xmlhttpRequest
 // @connect      generativelanguage.googleapis.com
+// @connect      crack-api.wrtn.ai
 // ==/UserScript==
 
 (function() {
@@ -20,11 +21,15 @@
     const DEFAULT_FORMAT = '{번역문} ({원문})';
 
     let characters = JSON.parse(GM_getValue('AITrans_chars', '{}'));
-    let settings = JSON.parse(GM_getValue('AITrans_settings',
-        '{"provider":"google","apiKey":"","firebaseConfig":"","model":"gemini-3.5-flash","lang":"English","customLang":"","format":"' + DEFAULT_FORMAT.replace(/"/g, '\\"') + '","activeChar":""}'
+    let settings = JSON.parse(GM_getValue('AITrans_settings', 
+        '{"provider":"google","apiKey":"","firebaseConfig":"","model":"gemini-3.5-flash","lang":"English","customLang":"","format":"' + DEFAULT_FORMAT.replace(/"/g, '\\"') + '","activeChar":"","useContext":true,"usePolish":false}'
     ));
+    
+    // 이전 버전 호환용 기본값 세팅
     if (settings.format === undefined) settings.format = DEFAULT_FORMAT;
     if (settings.customLang === undefined) settings.customLang = '';
+    if (settings.useContext === undefined) settings.useContext = true;
+    if (settings.usePolish === undefined) settings.usePolish = false;
 
     function saveSettings() { GM_setValue('AITrans_settings', JSON.stringify(settings)); }
     function saveChars() { GM_setValue('AITrans_chars', JSON.stringify(characters)); }
@@ -43,7 +48,6 @@
         if (/\bdark\b|theme-dark|dark-mode|darkmode|color-scheme-dark/.test(hints)) return true;
         if (/\blight\b|theme-light|light-mode|lightmode|color-scheme-light/.test(hints)) return false;
 
-        // 텍스트 색 밝기로 판별 (Scene Painter와 같은 방식)
         try {
             const probe = document.createElement('span');
             probe.style.cssText = 'position:fixed;left:-9999px;color:var(--text_primary, var(--foreground, inherit));';
@@ -75,11 +79,8 @@
 
         const proto = el.tagName === "TEXTAREA" ? window.HTMLTextAreaElement.prototype : window.HTMLInputElement.prototype;
         const setter = Object.getOwnPropertyDescriptor(proto, "value")?.set;
-        if (setter) {
-            setter.call(el, value);
-        } else {
-            el.value = value;
-        }
+        if (setter) setter.call(el, value);
+        else el.value = value;
 
         el.dispatchEvent(new Event("input", { bubbles: true }));
         el.dispatchEvent(new Event("change", { bubbles: true }));
@@ -112,51 +113,33 @@
     GM_addStyle(`
         #ai-trans-inline-group { display: flex; align-items: center; gap: 5px; margin-right: 8px; }
 
-        /* 인라인 버튼: Crack 하단 툴바의 둥근 아이콘 버튼과 통일 */
         .trans-action-btn, .trans-setting-btn {
             height: 2rem; width: 2rem; border-radius: 999px; padding: 0;
             font-size: 14px; cursor: pointer; transition: background .15s ease, transform .15s ease;
-            display: flex; align-items: center; justify-content: center;
-            box-shadow: none;
+            display: flex; align-items: center; justify-content: center; box-shadow: none;
         }
-        /* 다크 (기본) */
-        .trans-action-btn {
-            background: rgba(255,255,255,.09); color: #e8ecf5;
-            border: 1px solid rgba(255,255,255,.10);
-        }
+        .trans-action-btn { background: rgba(255,255,255,.09); color: #e8ecf5; border: 1px solid rgba(255,255,255,.10); }
         .trans-action-btn:hover { background: rgba(255,255,255,.16); transform: translateY(-1px); }
         .trans-action-btn:disabled { background: rgba(255,255,255,.05); color: rgba(255,255,255,.35); cursor: not-allowed; transform: none; }
-        .trans-setting-btn {
-            background: rgba(255,255,255,.06); color: #b9c0d0;
-            border: 1px solid rgba(255,255,255,.08); font-size: 12px;
-        }
+        .trans-setting-btn { background: rgba(255,255,255,.06); color: #b9c0d0; border: 1px solid rgba(255,255,255,.08); font-size: 12px; }
         .trans-setting-btn:hover { background: rgba(255,255,255,.13); color: #eceef6; }
 
-        /* 라이트 */
-        [data-ait-theme="light"] .trans-action-btn {
-            background: #f0f0f3; color: #444; border: 1px solid #dcdce2;
-        }
+        [data-ait-theme="light"] .trans-action-btn { background: #f0f0f3; color: #444; border: 1px solid #dcdce2; }
         [data-ait-theme="light"] .trans-action-btn:hover { background: #e5e5ea; }
-        [data-ait-theme="light"] .trans-setting-btn {
-            background: #f7f7fa; color: #777; border: 1px solid #e2e2e8;
-        }
+        [data-ait-theme="light"] .trans-setting-btn { background: #f7f7fa; color: #777; border: 1px solid #e2e2e8; }
         [data-ait-theme="light"] .trans-setting-btn:hover { background: #ececf1; color: #444; }
 
-        /* ===== 설정 패널 ===== */
         #ai-trans-panel {
-            position: fixed; top: 10vh; left: 5vw; z-index: 999999;
-            width: 90vw; max-width: 330px;
+            position: fixed; top: 10vh; left: 5vw; z-index: 999999; width: 90vw; max-width: 330px;
             border-radius: 16px; display: none; flex-direction: column; overflow: hidden;
             font-family: Pretendard, system-ui, -apple-system, "Apple SD Gothic Neo", sans-serif;
-            /* 다크 글라스 (기본) */
             background: linear-gradient(180deg, rgba(255,255,255,.06), rgba(255,255,255,.015)), rgba(20,22,31,.92);
             border: 1px solid rgba(205,216,255,.20); color: #e8ecf5;
             box-shadow: 0 20px 60px rgba(0,0,0,.45), inset 0 1px 0 rgba(255,255,255,.09);
             backdrop-filter: blur(16px) saturate(1.1); -webkit-backdrop-filter: blur(16px) saturate(1.1);
         }
         #ai-trans-panel[data-ait-theme="light"] {
-            background: #ffffff; border: 1px solid #ddd; color: #333;
-            box-shadow: 0 10px 30px rgba(0,0,0,.22);
+            background: #ffffff; border: 1px solid #ddd; color: #333; box-shadow: 0 10px 30px rgba(0,0,0,.22);
             backdrop-filter: none; -webkit-backdrop-filter: none;
         }
 
@@ -179,7 +162,7 @@
         #ai-trans-panel[data-ait-theme="light"] .ai-tab:hover { background: #f1f1f5; }
         #ai-trans-panel[data-ait-theme="light"] .ai-tab.active { background: #f1eefb; color: #5a43b5; box-shadow: inset 0 0 0 1px #d8cff2; }
 
-        .ai-content { padding: 12px; display: none; max-height: 62vh; overflow-y: auto; }
+        .ai-content { padding: 12px; display: none; max-height: 65vh; overflow-y: auto; }
         .ai-content::-webkit-scrollbar { width: 4px; }
         .ai-content::-webkit-scrollbar-thumb { background: rgba(255,255,255,.18); border-radius: 4px; }
         #ai-trans-panel[data-ait-theme="light"] .ai-content::-webkit-scrollbar-thumb { background: #ccc; }
@@ -187,6 +170,7 @@
 
         .ai-form-group { margin-bottom: 9px; }
         .ai-form-group label { display: block; font-size: 11px; margin-bottom: 4px; font-weight: 700; color: rgba(226,232,248,.72); }
+        .ai-form-group label.toggle-label { display: flex; align-items: center; gap: 4px; cursor: pointer; color: inherit; }
         #ai-trans-panel[data-ait-theme="light"] .ai-form-group label { color: #555; }
 
         .ai-input {
@@ -197,9 +181,7 @@
         .ai-input:focus { border-color: rgba(165,180,252,.60); background: rgba(255,255,255,.10); }
         .ai-input::placeholder { color: rgba(226,232,248,.38); }
         select.ai-input option { color: #111; background: #fff; }
-        #ai-trans-panel[data-ait-theme="light"] .ai-input {
-            background: #fff; color: #333; border: 1px solid #d6d6dd;
-        }
+        #ai-trans-panel[data-ait-theme="light"] .ai-input { background: #fff; color: #333; border: 1px solid #d6d6dd; }
         #ai-trans-panel[data-ait-theme="light"] .ai-input:focus { border-color: #8a72d8; }
         textarea.ai-input { resize: vertical; min-height: 50px; }
         #cfg-firebase { min-height: 70px; font-family: ui-monospace, monospace; font-size: 11px; white-space: pre-wrap; }
@@ -207,32 +189,24 @@
 
         .ai-hint { margin-top: 5px; font-size: 10.5px; line-height: 1.5; color: rgba(226,232,248,.52); }
         #ai-trans-panel[data-ait-theme="light"] .ai-hint { color: #888; }
-        .ai-hint code {
-            padding: 1px 5px; border-radius: 5px; font-size: 10px;
-            background: rgba(255,255,255,.10); border: 1px solid rgba(205,216,255,.14); color: #cfd8ff;
-        }
+        .ai-hint code { padding: 1px 5px; border-radius: 5px; font-size: 10px; background: rgba(255,255,255,.10); border: 1px solid rgba(205,216,255,.14); color: #cfd8ff; }
         #ai-trans-panel[data-ait-theme="light"] .ai-hint code { background: #f0eefa; border-color: #e0daf0; color: #5a43b5; }
 
         .ai-btn-full {
             width: 100%; border: 1px solid rgba(165,180,252,.34); padding: 9px; border-radius: 10px;
             cursor: pointer; font-weight: 800; margin-top: 6px; font-size: 12px;
-            background: linear-gradient(180deg, rgba(129,140,248,.30), rgba(106,90,232,.24)); color: #eef0ff;
-            transition: background .15s ease;
+            background: linear-gradient(180deg, rgba(129,140,248,.30), rgba(106,90,232,.24)); color: #eef0ff; transition: background .15s ease;
         }
         .ai-btn-full:hover { background: linear-gradient(180deg, rgba(129,140,248,.42), rgba(106,90,232,.34)); }
-        #ai-trans-panel[data-ait-theme="light"] .ai-btn-full {
-            background: #6A3DE8; color: #fff; border-color: #6A3DE8;
-        }
+        #ai-trans-panel[data-ait-theme="light"] .ai-btn-full { background: #6A3DE8; color: #fff; border-color: #6A3DE8; }
         #ai-trans-panel[data-ait-theme="light"] .ai-btn-full:hover { background: #5228CC; }
 
         .ai-divider { border-top: 1px solid rgba(205,216,255,.13); margin: 12px 0 8px; }
         #ai-trans-panel[data-ait-theme="light"] .ai-divider { border-top-color: #e5e5ea; }
 
         .char-item {
-            padding: 6px 9px; margin-bottom: 4px; border-radius: 8px; display: flex;
-            justify-content: space-between; font-size: 12px; cursor: pointer; align-items: center;
-            background: rgba(255,255,255,.05); border: 1px solid rgba(205,216,255,.12); color: inherit;
-            transition: border-color .15s ease;
+            padding: 6px 9px; margin-bottom: 4px; border-radius: 8px; display: flex; justify-content: space-between; font-size: 12px; cursor: pointer; align-items: center;
+            background: rgba(255,255,255,.05); border: 1px solid rgba(205,216,255,.12); color: inherit; transition: border-color .15s ease;
         }
         .char-item:hover { border-color: rgba(165,180,252,.55); }
         #ai-trans-panel[data-ait-theme="light"] .char-item { background: #f9f9fb; border-color: #e5e5ea; }
@@ -244,7 +218,7 @@
     `);
 
     // ===================================================================================
-    // [목표 언어 목록]
+    // [목표 언어 목록 및 형식 템플릿 처리]
     // ===================================================================================
     const LANGUAGES = [
         { value: 'English', label: '영어' },
@@ -267,16 +241,10 @@
     ];
 
     function getTargetLang() {
-        if (settings.lang === '__custom__') {
-            return (settings.customLang || '').trim() || 'English';
-        }
+        if (settings.lang === '__custom__') return (settings.customLang || '').trim() || 'English';
         return settings.lang || 'English';
     }
 
-    // ===================================================================================
-    // [출력 형식 템플릿]
-    // {번역문} = 번역된 대사, {원문} = 한국어 원문. {원문}은 생략 가능.
-    // ===================================================================================
     function getFormatTemplate() {
         let fmt = (settings.format || '').trim();
         if (!fmt.includes('{번역문}')) fmt = DEFAULT_FORMAT;
@@ -285,12 +253,8 @@
 
     function buildFormatInstruction() {
         const fmt = getFormatTemplate();
-        const pattern = fmt
-            .split('{번역문}').join('<TRANSLATED_DIALOGUE>')
-            .split('{원문}').join('<ORIGINAL_KOREAN_DIALOGUE>');
-        const example = fmt
-            .split('{번역문}').join('Hello, nice to meet you!')
-            .split('{원문}').join('안녕, 반가워!');
+        const pattern = fmt.split('{번역문}').join('<TRANSLATED_DIALOGUE>').split('{원문}').join('<ORIGINAL_KOREAN_DIALOGUE>');
+        const example = fmt.split('{번역문}').join('Hello, nice to meet you!').split('{원문}').join('안녕, 반가워!');
         return { pattern, example, includesOriginal: fmt.includes('{원문}') };
     }
 
@@ -308,12 +272,11 @@
         createPanel() {
             const panel = document.createElement('div');
             panel.id = 'ai-trans-panel';
-
             const langOptions = LANGUAGES.map(l => `<option value="${l.value}">${l.label}</option>`).join('');
 
             panel.innerHTML = `
                 <div class="ai-panel-header" id="ai-panel-drag">
-                    <span>🌐 번역 설정</span>
+                    <span>🌐 번역 설정 (V3.5)</span>
                     <span class="ai-panel-close" id="ai-panel-close">✕</span>
                 </div>
                 <div class="ai-tabs">
@@ -326,6 +289,7 @@
                         <label>적용할 캐릭터</label>
                         <select id="cfg-char" class="ai-input"><option value="">선택 안 함</option></select>
                     </div>
+                    
                     <div style="display:flex; gap:6px;">
                         <div class="ai-form-group" style="flex:1;">
                             <label>목표 언어</label>
@@ -346,13 +310,21 @@
                         <input type="text" id="cfg-custom-lang" class="ai-input" placeholder="예: Polish, Swahili, 고전 라틴어...">
                     </div>
 
-                    <div class="ai-form-group">
+                    <div class="ai-form-group" style="background: rgba(165,180,252,.1); padding: 8px 10px; border-radius: 8px; border: 1px solid rgba(165,180,252,.2); margin-top: 4px; display: flex; flex-direction: column; gap: 8px;">
+                        <label class="toggle-label" style="color: #818cf8;">
+                            <input type="checkbox" id="cfg-context" style="margin: 0;"> 🧠 대화 맥락 읽고 뉘앙스 반영하기
+                        </label>
+                        <label class="toggle-label" style="color: #fb923c;">
+                            <input type="checkbox" id="cfg-polish" style="margin: 0;"> ✍️ 번역 전 서술(* 또는 **) 화려하게 윤문
+                        </label>
+                    </div>
+
+                    <div class="ai-form-group" style="margin-top: 10px;">
                         <label>출력 형식</label>
                         <textarea id="cfg-format" class="ai-input" placeholder="${DEFAULT_FORMAT}"></textarea>
                         <div class="ai-hint">
                             <code>{번역문}</code> 자리에 번역된 대사, <code>{원문}</code> 자리에 한국어 원문이 들어가요.<br>
-                            예: <code>{번역문} ({원문})</code> · <code>{원문} → {번역문}</code> · <code>{번역문}</code> (원문 생략)<br>
-                            <b>**서술**</b> 부분은 항상 한국어 그대로 유지돼요.
+                            예: <code>{번역문} ({원문})</code> · <code>{원문} → {번역문}</code>
                         </div>
                     </div>
 
@@ -435,7 +407,6 @@
                 };
             });
 
-            // 설정값 불러오기
             const selProvider = document.getElementById('cfg-provider');
             const selLang = document.getElementById('cfg-lang');
             const groupKey = document.getElementById('group-api-key');
@@ -448,8 +419,9 @@
             document.getElementById('cfg-model').value = settings.model || 'gemini-3.5-flash';
             document.getElementById('cfg-format').value = settings.format || DEFAULT_FORMAT;
             document.getElementById('cfg-custom-lang').value = settings.customLang || '';
+            document.getElementById('cfg-context').checked = settings.useContext; 
+            document.getElementById('cfg-polish').checked = settings.usePolish;
 
-            // 저장된 언어가 목록에 없으면 (구버전 'Chinese' 등) 목록에 임시 추가
             if (settings.lang && ![...selLang.options].some(o => o.value === settings.lang)) {
                 const opt = document.createElement('option');
                 opt.value = settings.lang;
@@ -458,7 +430,6 @@
             }
             selLang.value = settings.lang || 'English';
 
-            // Provider 변경에 따른 UI 토글
             const toggleProviderUI = () => {
                 const isGoogle = selProvider.value === 'google';
                 groupKey.style.display = isGoogle ? 'block' : 'none';
@@ -467,7 +438,6 @@
             selProvider.addEventListener('change', toggleProviderUI);
             toggleProviderUI();
 
-            // 직접 입력 언어 토글
             const toggleCustomLangUI = () => {
                 groupCustomLang.style.display = selLang.value === '__custom__' ? 'block' : 'none';
             };
@@ -476,9 +446,7 @@
 
             document.getElementById('btn-save-cfg').onclick = () => {
                 const fmt = document.getElementById('cfg-format').value.trim();
-                if (fmt && !fmt.includes('{번역문}')) {
-                    return toast('출력 형식에 {번역문}이 반드시 포함돼야 해요', 'warn');
-                }
+                if (fmt && !fmt.includes('{번역문}')) return toast('출력 형식에 {번역문}이 반드시 포함돼야 해요', 'warn');
 
                 settings.provider = selProvider.value;
                 settings.apiKey = document.getElementById('cfg-key').value;
@@ -488,10 +456,10 @@
                 settings.customLang = document.getElementById('cfg-custom-lang').value.trim();
                 settings.format = fmt || DEFAULT_FORMAT;
                 settings.activeChar = document.getElementById('cfg-char').value;
+                settings.useContext = document.getElementById('cfg-context').checked; 
+                settings.usePolish = document.getElementById('cfg-polish').checked;
 
-                if (settings.lang === '__custom__' && !settings.customLang) {
-                    return toast('직접 입력할 언어를 적어주세요', 'warn');
-                }
+                if (settings.lang === '__custom__' && !settings.customLang) return toast('직접 입력할 언어를 적어주세요', 'warn');
 
                 saveSettings();
                 toast('기본 설정 저장됨', 'success');
@@ -549,7 +517,7 @@
     };
 
     // ===================================================================================
-    // [번역 API 호출]
+    // [번역 엔진 & API 호출]
     // ===================================================================================
     function getChatInput() {
         return document.querySelector('.__chat_input_textarea') ||
@@ -557,12 +525,28 @@
                document.querySelector('textarea');
     }
 
-    // Firebase 설정 파싱
+    async function getRecentContext() {
+        const path = location.pathname.match(/\/stories\/([^/]+)\/episodes\/([^/]+)/);
+        if (!path) {
+            const bubbles = Array.from(document.querySelectorAll('div[dir="auto"], .whitespace-pre-wrap, p')).slice(-6);
+            return bubbles.map(b => b.textContent.trim()).filter(Boolean).join('\n\n');
+        }
+        try {
+            const token = document.cookie.split(";").map((c) => c.trim()).find((c) => c.startsWith("access_token="))?.slice(13);
+            if (!token) return "";
+            const res = await fetch(`https://crack-api.wrtn.ai/crack-gen/v3/chats/${path[2]}/messages?limit=4`, {
+                headers: { Authorization: `Bearer ${token}`, "Content-Type": "application/json" }
+            });
+            const json = await res.json();
+            const msgs = (json.data ?? json).messages ?? [];
+            return msgs.reverse().map(m => `[${m.role === "assistant" ? "상대방" : "나"}]: ${m.content}`).join("\n\n");
+        } catch(e) { return ""; }
+    }
+
     function parseVertexContent(scriptStr) {
         try {
             const match = scriptStr.match(/firebaseConfig\s*=\s*(\{[\s\S]*?\});/);
             if (match && match[1]) return new Function("return " + match[1])();
-
             if (scriptStr.includes("apiKey")) {
                 const startText = "firebaseConfig = {";
                 const startIndex = scriptStr.indexOf(startText);
@@ -576,32 +560,6 @@
             }
         } catch(e) {}
         return null;
-    }
-
-    function buildSystemPrompt() {
-        const lang = getTargetLang();
-        const { pattern, example, includesOriginal } = buildFormatInstruction();
-
-        let sysPrompt = `Translate the roleplay text to ${lang}.
-Rules:
-1. Ignore and DO NOT translate any narrative wrapped in ** (e.g. **He smiled.**). Keep it exactly as original Korean.
-2. Translate the spoken dialogue (text outside the **) to ${lang}.
-3. 🚨CRITICAL: Output each dialogue segment EXACTLY in this format: ${pattern}`;
-
-        if (!includesOriginal) {
-            sysPrompt += `\n   Do NOT append the original Korean dialogue. Output only what the format specifies.`;
-        }
-
-        sysPrompt += `
-Example Input: **손을 흔들며** 안녕, 반가워!
-Example Output: **손을 흔들며** ${example}`;
-
-        if (settings.activeChar && characters[settings.activeChar]) {
-            const c = characters[settings.activeChar];
-            sysPrompt += `\n4. Apply Character Persona to the dialogue translation: Name:${settings.activeChar}, Age:${c.age}, Gender:${c.gender}, Job:${c.job}, Traits:${c.traits}`;
-        }
-
-        return sysPrompt;
     }
 
     async function executeTranslation() {
@@ -620,15 +578,64 @@ Example Output: **손을 흔들며** ${example}`;
         btn.disabled = true;
         icon.innerText = '⏳';
         icon.classList.add('spin-icon');
-        toast('번역 중...', 'info');
+        toast('번역 준비 중...', 'info');
 
-        const sysPrompt = buildSystemPrompt();
+        let contextText = "";
+        if (settings.useContext) {
+            toast('대화 맥락 읽는 중...', 'info');
+            contextText = await getRecentContext();
+        }
+
+        const lang = getTargetLang();
+        const { pattern, example, includesOriginal } = buildFormatInstruction();
+
+        let sysPrompt = `You are a specialized RP translator and writer. Process the input text which consists of [NARRATIVE] and [DIALOGUE].\n`;
+        sysPrompt += `The [NARRATIVE] is any text wrapped in asterisks (either * or **).\n`;
+        sysPrompt += `The [DIALOGUE] is the spoken text outside the asterisks.\n\n`;
+        
+        if (contextText) {
+            sysPrompt += `[Recent Conversation Context]\n${contextText}\n\n*CRITICAL: Use the context ONLY to understand the situation and tone. DO NOT translate the context.*\n\n`;
+        }
+
+        sysPrompt += `[RULES]\n`;
+        
+        if (settings.usePolish) {
+            sysPrompt += `1. NARRATIVE: You MUST aggressively rewrite, expand, and polish the Korean [NARRATIVE] into a highly descriptive, emotional, and immersive web novel style in KOREAN. Even if the original narrative is already long, enhance its vocabulary and emotional depth like a professional author. NEVER translate the narrative to a foreign language. DO NOT just copy the original. Wrap the polished narrative in *.\n`;
+        } else {
+            sysPrompt += `1. NARRATIVE: DO NOT translate or modify the Korean [NARRATIVE]. Keep it EXACTLY as the original Korean text. Wrap it in *.\n`;
+        }
+
+        sysPrompt += `2. DIALOGUE: Translate the [DIALOGUE] to ${lang}.\n`;
+        sysPrompt += `3. FORMAT: 🚨CRITICAL: Output each dialogue segment EXACTLY in this format: ${pattern}\n`;
+        
+        if (!includesOriginal) {
+            sysPrompt += `   Do NOT append the original Korean dialogue. Output only what the format specifies.\n`;
+        }
+
+        sysPrompt += `\n[EXAMPLES]\n`;
+        if (settings.usePolish) {
+            sysPrompt += `Example Input: *창밖을 보며* 안녕, 반가워!\n`;
+            sysPrompt += `Example Output: *유리창에 부딪히는 거센 빗방울을 물끄러미 응시하며, 쓸쓸한 눈빛으로 입을 열었다.* ${example}\n`;
+        } else {
+            sysPrompt += `Example Input: *창밖을 보며* 안녕, 반가워!\n`;
+            sysPrompt += `Example Output: *창밖을 보며* ${example}\n`;
+        }
+
+        if (settings.activeChar && characters[settings.activeChar]) {
+            const c = characters[settings.activeChar];
+            sysPrompt += `\n[Character Persona for Dialogue Translation]\nName:${settings.activeChar}, Age:${c.age}, Gender:${c.gender}, Job:${c.job}, Traits:${c.traits}`;
+        }
 
         try {
             let translatedText = "";
+            const safetySettings = [
+                { category: "HARM_CATEGORY_HATE_SPEECH", threshold: "BLOCK_NONE" },
+                { category: "HARM_CATEGORY_SEXUALLY_EXPLICIT", threshold: "BLOCK_NONE" },
+                { category: "HARM_CATEGORY_HARASSMENT", threshold: "BLOCK_NONE" },
+                { category: "HARM_CATEGORY_DANGEROUS_CONTENT", threshold: "BLOCK_NONE" }
+            ];
 
             if (settings.provider === 'firebase') {
-                // Firebase 처리
                 const config = parseVertexContent(settings.firebaseConfig);
                 if (!config) throw new Error("Firebase 스크립트 형식이 올바르지 않습니다.");
 
@@ -636,41 +643,26 @@ Example Output: **손을 흔들며** ${example}`;
                 const { getAI, getGenerativeModel, VertexAIBackend, HarmBlockThreshold, HarmCategory } = await import("https://www.gstatic.com/firebasejs/12.8.0/firebase-ai.js");
 
                 let app;
-                try {
-                    app = initializeApp(config, "trans-ai-" + Date.now());
-                } catch(e) {
-                    throw new Error("Firebase 초기화 실패: " + e.message);
-                }
+                try { app = initializeApp(config, "trans-ai-" + Date.now()); } catch(e) { throw new Error("Firebase 초기화 실패: " + e.message); }
 
                 const ai = getAI(app, { backend: new VertexAIBackend('global') });
-                const safetySettings = [
+                const fSafety = [
                     { category: HarmCategory.HARM_CATEGORY_HATE_SPEECH, threshold: HarmBlockThreshold.OFF },
                     { category: HarmCategory.HARM_CATEGORY_SEXUALLY_EXPLICIT, threshold: HarmBlockThreshold.OFF },
                     { category: HarmCategory.HARM_CATEGORY_HARASSMENT, threshold: HarmBlockThreshold.OFF },
                     { category: HarmCategory.HARM_CATEGORY_DANGEROUS_CONTENT, threshold: HarmBlockThreshold.OFF }
                 ];
 
-                const model = getGenerativeModel(ai, {
-                    model: settings.model,
-                    systemInstruction: sysPrompt,
-                    safetySettings: safetySettings
-                });
-
+                const model = getGenerativeModel(ai, { model: settings.model, systemInstruction: sysPrompt, safetySettings: fSafety });
                 const result = await model.generateContent(rawText);
                 const response = await result.response;
                 translatedText = response.text().trim();
 
             } else {
-                // 기존 Google API 처리
                 const payloadData = {
                     system_instruction: { parts: [{ text: sysPrompt }] },
                     contents: [{ parts: [{ text: rawText }] }],
-                    safetySettings: [
-                        { category: "HARM_CATEGORY_HATE_SPEECH", threshold: "BLOCK_NONE" },
-                        { category: "HARM_CATEGORY_SEXUALLY_EXPLICIT", threshold: "BLOCK_NONE" },
-                        { category: "HARM_CATEGORY_HARASSMENT", threshold: "BLOCK_NONE" },
-                        { category: "HARM_CATEGORY_DANGEROUS_CONTENT", threshold: "BLOCK_NONE" }
-                    ]
+                    safetySettings: safetySettings
                 };
 
                 translatedText = await new Promise((resolve, reject) => {
@@ -688,14 +680,10 @@ Example Output: **손을 흔들며** ${example}`;
                                     if (cand.finishReason === "SAFETY") throw new Error("안전 필터 차단됨");
                                     if (!cand.content || !cand.content.parts || cand.content.parts.length === 0) throw new Error("빈 텍스트 반환됨");
                                     resolve(cand.content.parts[0].text.trim());
-                                } else if (data.error) {
-                                    throw new Error(`${data.error.message}`);
-                                } else {
-                                    throw new Error("결과값 없음");
-                                }
+                                } else if (data.error) { throw new Error(`${data.error.message}`); } 
+                                else { throw new Error("결과값 없음"); }
                             } catch (e) {
-                                if (e instanceof SyntaxError) reject(new Error('모델명/키 오류'));
-                                else reject(e);
+                                if (e instanceof SyntaxError) reject(new Error('모델명/키 오류')); else reject(e);
                             }
                         },
                         onerror: () => reject(new Error('네트워크 오류 (API/인터넷 확인)'))
@@ -719,7 +707,6 @@ Example Output: **손을 흔들며** ${example}`;
     // [UI 자동 주입 로직]
     // ===================================================================================
     function findSendContainer() {
-        // 대시보드 버튼에 낚이지 않도록, 하단 툴바(</> 버튼 있는 곳)를 정확히 지정합니다.
         const toolbar = document.querySelector('.flex.items-center.space-x-2');
         return toolbar || null;
     }
@@ -748,7 +735,6 @@ Example Output: **손을 흔들며** ${example}`;
                 applyAitTheme();
             };
         }
-
         applyAitTheme();
     }
 
