@@ -2,7 +2,7 @@
 // @name         AI 캐챗 브금 플레이어
 // @namespace    http://tampermonkey.net/
 // @author       나 이뤼붕과 젬민이쉑
-// @version      7.2.1
+// @version      7.2.2
 // @description  캐챗 브금 자동/수동 플레이어
 // @match        https://crack.wrtn.ai/*
 // @grant        GM_addStyle
@@ -402,9 +402,6 @@
         const context = await getRecentContext();
         if (!context) throw new Error("대화 내용이 없습니다.");
 
-        const currentHash = hashText(context);
-        if(currentHash === lastContextHash) return console.log("대화 내용 변경 없음. API 호출 스킵.");
-        lastContextHash = currentHash;
 
         const sysPrompt = `당신은 롤플레잉 게임의 베테랑 음악 감독입니다. 주어진 대화(최근 3~5턴)의 "전체적인 흐름과 스토리 맥락"을 파악하고, 분위기에 완벽하게 어울리는 유튜브 배경음악 검색어를 제시하세요.\n[규칙]\n1. 최근 대화의 기승전결 분석.\n2. (장르/악기) + (무드/감정) + (상황/배경) 조합.\n3. 반드시 'BGM' 또는 'OST' 포함.\n4. 실존 가수, 노래제목 절대 금지.\n5. 오직 검색어 한 줄만 출력 (특수기호, 설명 금지).\n예: 사이버펑크 어두운 골목 긴장되는 BGM`;
 
