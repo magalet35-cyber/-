@@ -291,47 +291,68 @@
     };
 
     // ===================================================================================
-    // [4] 3단계 폭포수 엔진 (통합 및 경량화 완료)
+    // [4] 3단계 폭포수 엔진 (모바일 환경 특화 + 생존율 극대화)
     // ===================================================================================
     function extractVideoIds(htmlText) {
         const ids = [];
-        const regex = /("videoId"\s*:\s*"|\/watch\?v=|youtu\.be\/|v%3D)([a-zA-Z0-9_-]{11})/g;
+        // 정규식 강화: 봇 차단 페이지나 모바일 DOM에서도 ID만 정확히 긁어오도록 개선
+        const regex = /(?:videoId["'\s:]+|v=|youtu\.be\/|\/watch\?v=|%3Fv%3D)([a-zA-Z0-9_-]{11})/g;
         let match;
-        while ((match = regex.exec(htmlText)) !== null) if(!ids.includes(match[2])) ids.push(match[2]);
+        while ((match = regex.exec(htmlText)) !== null) {
+            if(!ids.includes(match[1])) ids.push(match[1]);
+        }
         return ids;
     }
 
     function executeCascadeSearch(query, step = 0) {
-        const safeQuery = query.includes("BGM") || query.includes("OST") ? query : query + " BGM OST";
-
+        const safeQuery = query.includes("BGM") || query.includes("OST") ? query : query + " BGM OST"; 
+        
+        // 모바일 통신에 유리하도록 기본 User-Agent 유지 및 타임아웃 연장, Lite 백업 엔진 도입
         const engines = [
-            { name: "PC 서버 연결 중...", url: `https://www.youtube.com/results?search_query=${encodeURIComponent(safeQuery)}&sp=EgIQAQ%3D%3D`, ua: "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36" },
-            { name: "모바일 우회 중...", url: `https://m.youtube.com/results?search_query=${encodeURIComponent(safeQuery)}&sp=EgIQAQ%3D%3D`, ua: "Mozilla/5.0 (iPhone; CPU iPhone OS 16_0 like Mac OS X) AppleWebKit/605.1.15 Mobile/15E148 Safari/604.1" },
-            { name: "백업 서버 탐색 중...", url: `https://html.duckduckgo.com/html/?q=${encodeURIComponent('site:youtube.com ' + query)}&kl=kr-kr`, ua: navigator.userAgent }
+            { name: "모바일 유튜브 서버", url: `https://m.youtube.com/results?search_query=${encodeURIComponent(safeQuery)}`, ua: navigator.userAgent },
+            { name: "PC 유튜브 우회", url: `https://www.youtube.com/results?search_query=${encodeURIComponent(safeQuery)}`, ua: "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36" },
+            { name: "경량형 백업 서버", url: `https://lite.duckduckgo.com/lite/`, method: "POST", data: `q=${encodeURIComponent('site:youtube.com ' + query)}`, ua: navigator.userAgent }
         ];
 
         if (step >= engines.length) {
-            UI.updateWidgetText("⚠️ 노래 검색 최종 실패", "다른 상황(대사)으로 재분석을 권장합니다.");
+            UI.updateWidgetText("⚠️ 노래 검색 최종 실패", "네트워크가 너무 느리거나 차단되었습니다.");
             UI.els['play-btn'].innerText = '▶';
-            currentVideoIds = ['jfKfPfyJRdk'];
+            currentVideoIds = ['jfKfPfyJRdk']; 
             return;
         }
 
         UI.updateWidgetText(`🔍 [${query}]`, `엔진 ${step+1}: ${engines[step].name}`);
-
-        GM_xmlhttpRequest({
-            method: "GET", url: engines[step].url, anonymous: true, timeout: 5000,
-            headers: { "User-Agent": engines[step].ua, "Cookie": "CONSENT=YES+cb.20230101-01-p0.ko+FX+433;" },
+        
+        const reqOpt = {
+            method: engines[step].method || "GET",
+            url: engines[step].url,
+            timeout: 8500, // 모바일 환경 고려 제한시간 대폭 연장 (5초 -> 8.5초)
+            headers: { 
+                "User-Agent": engines[step].ua,
+                "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8"
+            },
             onload: (res) => {
                 const ids = extractVideoIds(res.responseText);
-                if (ids.length > 0) { currentVideoIds = ids.slice(0, 15); currentVideoIndex = 0; playCurrentIndex(); }
-                else executeCascadeSearch(query, step + 1);
+                if (ids.length > 0) { 
+                    currentVideoIds = ids.slice(0, 15); 
+                    currentVideoIndex = 0; 
+                    playCurrentIndex(); 
+                } else {
+                    executeCascadeSearch(query, step + 1);
+                }
             },
             onerror: () => executeCascadeSearch(query, step + 1),
             ontimeout: () => executeCascadeSearch(query, step + 1)
-        });
-    }
+        };
 
+        // POST 방식일 경우 Form 데이터 처리
+        if (engines[step].data) {
+            reqOpt.headers["Content-Type"] = "application/x-www-form-urlencoded";
+            reqOpt.data = engines[step].data;
+        }
+
+        GM_xmlhttpRequest(reqOpt);
+    }
     // ===================================================================================
     // [5] 진행바 동기화 (캐싱 적용 최적화)
     // ===================================================================================
