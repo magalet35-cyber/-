@@ -2,8 +2,8 @@
 // @name         AI 캐챗 브금 플레이어
 // @namespace    http://tampermonkey.net/
 // @author       나 이뤼붕과 젬민이쉑
-// @version      7.2.2
-// @description  캐챗 브금 자동/수동 플레이어
+// @version      7.4
+// @description  캐챗 브금 자동/수동 플레이어 (대화 수집 4턴 최적화 및 3.1-flash-lite 모델 추가)
 // @match        https://crack.wrtn.ai/*
 // @grant        GM_addStyle
 // @grant        GM_setValue
@@ -32,7 +32,7 @@
     let autoTurnCounter = 0;
     const AUTO_TURN_THRESHOLD = 6;
 
-    let settings = JSON.parse(GM_getValue('AIBGM_settings', '{"provider":"google","apiKey":"","firebaseConfig":"","model":"gemini-3.5-flash","autoSync":false}'));
+    let settings = JSON.parse(GM_getValue('AIBGM_settings', '{"provider":"google","apiKey":"","firebaseConfig":"","model":"gemini-3.5-flash","autoSync":false,"autoTurnLimit":6}'));
     function saveSettings() { GM_setValue('AIBGM_settings', JSON.stringify(settings)); }
 
     // ===================================================================================
@@ -90,7 +90,7 @@
     }
 
     // ===================================================================================
-    // [2] CSS 스타일 (변경 없음)
+    // [2] CSS 스타일
     // ===================================================================================
     GM_addStyle(`
         #ai-bgm-widget { position: fixed; z-index: 999998; background: #2c2c2e; border-radius: 30px; box-shadow: 0 8px 20px rgba(0,0,0,0.5); display: flex; align-items: center; padding: 4px 9px; box-sizing: border-box; transition: width 0.3s cubic-bezier(0.25, 0.8, 0.25, 1), height 0.3s ease, border-radius 0.3s ease; font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif; user-select: none; overflow: hidden; }
@@ -151,7 +151,8 @@
                 else { widget.style.top = '15vh'; widget.style.right = '5vw'; }
             } catch {}
 
-            const autoLabel = settings.autoSync ? `🤖 Auto: ON (${autoTurnCounter}/${AUTO_TURN_THRESHOLD})` : "🤖 Auto: OFF";
+            const autoLimit = settings.autoTurnLimit || 6;
+            const autoLabel = settings.autoSync ? `🤖 Auto: ON (${autoTurnCounter}/${autoLimit})` : "🤖 Auto: OFF";
 
             widget.innerHTML = `
                 <div class="bgm-album-art" id="bgm-art-click">AI<br>BGM</div>
@@ -215,11 +216,26 @@
 
         createSettings() {
             const panel = document.createElement('div'); panel.id = 'bgm-settings-panel';
+            // 🔥 3.1-flash-lite 모델 추가
             panel.innerHTML = `
                 <div class="bgm-set-header"><span>🎵 API 설정</span><span class="bgm-set-close" id="bgm-set-close">✕</span></div>
                 <div class="bgm-set-content">
                     <label>API 제공자</label><select id="bgm-cfg-provider" class="bgm-input"><option value="google">Google API</option><option value="firebase">Firebase Vertex AI</option></select>
-                    <label>사용 모델</label><select id="bgm-cfg-model" class="bgm-input"><option value="gemini-3.5-flash">3.5 Flash</option><option value="gemini-3.1-pro-preview">3.1 Pro</option></select>
+                    <label>사용 모델</label>
+                    <select id="bgm-cfg-model" class="bgm-input">
+                        <option value="gemini-3.5-flash">3.5 Flash</option>
+                        <option value="gemini-3.1-pro-preview">3.1 Pro</option>
+                        <option value="gemini-3.1-flash-lite">3.1 Flash Lite</option>
+                    </select>
+                    <label>자동 검색 주기 (대화 턴)</label>
+                    <select id="bgm-cfg-turn" class="bgm-input">
+                        <option value="2">매 1턴 (말풍선 2개)</option>
+                        <option value="4">매 2턴 (말풍선 4개)</option>
+                        <option value="6">매 3턴 (말풍선 6개)</option>
+                        <option value="8">매 4턴 (말풍선 8개)</option>
+                        <option value="10">매 5턴 (말풍선 10개)</option>
+                        <option value="12">매 6턴 (말풍선 12개)</option>
+                    </select>
                     <div id="bgm-grp-key"><label>API 키</label><input type="password" id="bgm-cfg-key" class="bgm-input" placeholder="Google API Key 입력"></div>
                     <div id="bgm-grp-fb" style="display:none;"><label>Firebase 설정</label><textarea id="bgm-cfg-fb" class="bgm-input" style="height:65px;" placeholder="firebaseConfig = {...}"></textarea></div>
                     <button class="bgm-btn" id="bgm-btn-save">설정 저장</button>
@@ -257,28 +273,46 @@
                 settings.autoSync = !settings.autoSync; saveSettings();
                 autoTurnCounter = 0;
                 e.target.setAttribute('data-on', settings.autoSync);
-                e.target.innerText = settings.autoSync ? `🤖 Auto: ON (0/${AUTO_TURN_THRESHOLD})` : '🤖 Auto: OFF';
+                const limit = settings.autoTurnLimit || 6;
+                e.target.innerText = settings.autoSync ? `🤖 Auto: ON (0/${limit})` : '🤖 Auto: OFF';
             };
 
             document.getElementById('bgm-open-settings').onclick = (e) => { e.stopPropagation(); panel.style.display = panel.style.display === 'flex' ? 'none' : 'flex'; UI.updateSettingsPosition(); };
             document.getElementById('bgm-set-close').onclick = (e) => { e.stopPropagation(); panel.style.display = 'none'; };
 
             const selProvider = document.getElementById('bgm-cfg-provider');
-            selProvider.value = settings.provider || 'google'; document.getElementById('bgm-cfg-key').value = settings.apiKey || '';
-            document.getElementById('bgm-cfg-fb').value = settings.firebaseConfig || ''; document.getElementById('bgm-cfg-model').value = settings.model || 'gemini-3.5-flash';
+            const selTurn = document.getElementById('bgm-cfg-turn');
+
+            selProvider.value = settings.provider || 'google';
+            document.getElementById('bgm-cfg-key').value = settings.apiKey || '';
+            document.getElementById('bgm-cfg-fb').value = settings.firebaseConfig || '';
+            document.getElementById('bgm-cfg-model').value = settings.model || 'gemini-3.5-flash';
+            selTurn.value = settings.autoTurnLimit || 6;
+
             selProvider.onchange = () => { document.getElementById('bgm-grp-key').style.display = selProvider.value === 'google' ? 'block' : 'none'; document.getElementById('bgm-grp-fb').style.display = selProvider.value === 'google' ? 'none' : 'block'; };
             selProvider.onchange();
 
             document.getElementById('bgm-btn-save').onclick = (e) => {
-                e.stopPropagation(); settings.provider = selProvider.value; settings.model = document.getElementById('bgm-cfg-model').value;
-                settings.apiKey = document.getElementById('bgm-cfg-key').value; settings.firebaseConfig = document.getElementById('bgm-cfg-fb').value;
-                saveSettings(); panel.style.display = 'none';
+                e.stopPropagation();
+                settings.provider = selProvider.value;
+                settings.model = document.getElementById('bgm-cfg-model').value;
+                settings.apiKey = document.getElementById('bgm-cfg-key').value;
+                settings.firebaseConfig = document.getElementById('bgm-cfg-fb').value;
+                settings.autoTurnLimit = parseInt(selTurn.value, 10) || 6;
+
+                saveSettings();
+                panel.style.display = 'none';
+
+                if(settings.autoSync && UI.els['auto-btn']) {
+                    UI.els['auto-btn'].innerText = `🤖 Auto: ON (${autoTurnCounter}/${settings.autoTurnLimit})`;
+                }
             };
 
             this.els['sync-btn'].onclick = async (e) => {
                 e.stopPropagation(); const btn = e.target; if (btn.classList.contains('spinning')) return;
                 autoTurnCounter = 0;
-                if(settings.autoSync) this.els['auto-btn'].innerText = `🤖 Auto: ON (0/${AUTO_TURN_THRESHOLD})`;
+                const limit = settings.autoTurnLimit || 6;
+                if(settings.autoSync) this.els['auto-btn'].innerText = `🤖 Auto: ON (0/${limit})`;
 
                 btn.classList.add('spinning');
                 UI.updateWidgetText("AI 맥락 파악 중...", "가장 찰떡인 BGM 키워드를 고릅니다 ✨");
@@ -295,7 +329,6 @@
     // ===================================================================================
     function extractVideoIds(htmlText) {
         const ids = [];
-        // 정규식 강화: 봇 차단 페이지나 모바일 DOM에서도 ID만 정확히 긁어오도록 개선
         const regex = /(?:videoId["'\s:]+|v=|youtu\.be\/|\/watch\?v=|%3Fv%3D)([a-zA-Z0-9_-]{11})/g;
         let match;
         while ((match = regex.exec(htmlText)) !== null) {
@@ -305,9 +338,8 @@
     }
 
     function executeCascadeSearch(query, step = 0) {
-        const safeQuery = query.includes("BGM") || query.includes("OST") ? query : query + " BGM OST"; 
-        
-        // 모바일 통신에 유리하도록 기본 User-Agent 유지 및 타임아웃 연장, Lite 백업 엔진 도입
+        const safeQuery = query.includes("BGM") || query.includes("OST") ? query : query + " BGM OST";
+
         const engines = [
             { name: "모바일 유튜브 서버", url: `https://m.youtube.com/results?search_query=${encodeURIComponent(safeQuery)}`, ua: navigator.userAgent },
             { name: "PC 유튜브 우회", url: `https://www.youtube.com/results?search_query=${encodeURIComponent(safeQuery)}`, ua: "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36" },
@@ -317,26 +349,26 @@
         if (step >= engines.length) {
             UI.updateWidgetText("⚠️ 노래 검색 최종 실패", "네트워크가 너무 느리거나 차단되었습니다.");
             UI.els['play-btn'].innerText = '▶';
-            currentVideoIds = ['jfKfPfyJRdk']; 
+            currentVideoIds = ['jfKfPfyJRdk'];
             return;
         }
 
         UI.updateWidgetText(`🔍 [${query}]`, `엔진 ${step+1}: ${engines[step].name}`);
-        
+
         const reqOpt = {
             method: engines[step].method || "GET",
             url: engines[step].url,
-            timeout: 8500, // 모바일 환경 고려 제한시간 대폭 연장 (5초 -> 8.5초)
-            headers: { 
+            timeout: 8500,
+            headers: {
                 "User-Agent": engines[step].ua,
                 "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8"
             },
             onload: (res) => {
                 const ids = extractVideoIds(res.responseText);
-                if (ids.length > 0) { 
-                    currentVideoIds = ids.slice(0, 15); 
-                    currentVideoIndex = 0; 
-                    playCurrentIndex(); 
+                if (ids.length > 0) {
+                    currentVideoIds = ids.slice(0, 15);
+                    currentVideoIndex = 0;
+                    playCurrentIndex();
                 } else {
                     executeCascadeSearch(query, step + 1);
                 }
@@ -345,7 +377,6 @@
             ontimeout: () => executeCascadeSearch(query, step + 1)
         };
 
-        // POST 방식일 경우 Form 데이터 처리
         if (engines[step].data) {
             reqOpt.headers["Content-Type"] = "application/x-www-form-urlencoded";
             reqOpt.data = engines[step].data;
@@ -353,8 +384,9 @@
 
         GM_xmlhttpRequest(reqOpt);
     }
+
     // ===================================================================================
-    // [5] 진행바 동기화 (캐싱 적용 최적화)
+    // [5] 진행바 동기화
     // ===================================================================================
     const fmtTime = sec => (isNaN(sec) || !isFinite(sec)) ? "0:00" : `${Math.floor(sec / 60)}:${Math.floor(sec % 60).toString().padStart(2, '0')}`;
 
@@ -388,11 +420,13 @@
 
     async function getRecentContext() {
         const path = location.pathname.match(/\/stories\/([^/]+)\/episodes\/([^/]+)/);
-        if (!path) return Array.from(document.querySelectorAll('div[dir="auto"], .whitespace-pre-wrap, p')).slice(-20).map(b => b.textContent.trim()).filter(Boolean).join('\n\n');
+        // 🔥 대화 수집량 8개(4턴)로 최적화
+        if (!path) return Array.from(document.querySelectorAll('div[dir="auto"], .whitespace-pre-wrap, p')).slice(-8).map(b => b.textContent.trim()).filter(Boolean).join('\n\n');
         try {
             const token = document.cookie.split(";").map(c => c.trim()).find(c => c.startsWith("access_token="))?.slice(13);
             if (!token) return "";
-            const res = await fetch(`https://crack-api.wrtn.ai/crack-gen/v3/chats/${path[2]}/messages?limit=10`, { headers: { Authorization: `Bearer ${token}` } });
+            // 🔥 API 호출량 8개(4턴)로 최적화
+            const res = await fetch(`https://crack-api.wrtn.ai/crack-gen/v3/chats/${path[2]}/messages?limit=8`, { headers: { Authorization: `Bearer ${token}` } });
             const json = await res.json();
             return (json.data ?? json).messages?.reverse().map(m => `[${m.role === 'user' ? '사용자' : '캐릭터'}]: ${m.content}`).join("\n\n") || "";
         } catch(e) { return ""; }
@@ -402,8 +436,41 @@
         const context = await getRecentContext();
         if (!context) throw new Error("대화 내용이 없습니다.");
 
+        // 🔥 프롬프트 텍스트도 '최근 4턴'으로 통일
+        const sysPrompt = `당신은 롤플레잉 게임의 베테랑 음악 감독입니다.
+주어진 대화(최근 4턴)의 "전체적인 흐름과 스토리 맥락"을 종합적으로 분석하고,
+현재 분위기에 완벽하게 어울리는 유튜브 배경음악 검색어를 제시하세요.
 
-        const sysPrompt = `당신은 롤플레잉 게임의 베테랑 음악 감독입니다. 주어진 대화(최근 3~5턴)의 "전체적인 흐름과 스토리 맥락"을 파악하고, 분위기에 완벽하게 어울리는 유튜브 배경음악 검색어를 제시하세요.\n[규칙]\n1. 최근 대화의 기승전결 분석.\n2. (장르/악기) + (무드/감정) + (상황/배경) 조합.\n3. 반드시 'BGM' 또는 'OST' 포함.\n4. 실존 가수, 노래제목 절대 금지.\n5. 오직 검색어 한 줄만 출력 (특수기호, 설명 금지).\n예: 사이버펑크 어두운 골목 긴장되는 BGM`;
+[분석 방법]
+1. 최근 4턴 전체를 훑어 상황의 기승전결(도입-전개-전환-현재)을 파악할 것.
+   가장 마지막 대사 한 줄만 보고 판단하는 것은 절대 금지.
+2. 대화 중 감정선이 바뀌었다면(예: 긴장 → 안도, 갈등 → 화해) 가장 최근의
+   "현재 감정 상태"에 가중치를 두되, 직전 맥락과 완전히 단절된 키워드는 쓰지 말 것.
+3. 상황의 성격을 다음 중 하나 이상으로 분류한 뒤 검색어에 반영할 것:
+   전투 / 추격 / 탐험 / 로맨스 / 이별 / 갈등 / 미스터리 / 휴식 / 축제 / 비극 / 승리
+
+[검색어 구성 규칙]
+4. 검색어는 다음 3요소를 조합해 구성할 것:
+   (a) 장르 또는 악기(예: 오케스트라, 로파이, 피아노, 신스, 국악, 스트링)
+   (b) 무드/감정 형용사(예: 긴장되는, 웅장한, 잔잔한, 애절한, 몽환적인)
+   (c) 배경/상황 키워드(예: 전투, 던전, 카페, 폐허, 궁전) — 필요시 생략 가능
+5. 반드시 'BGM' 또는 'OST' 중 하나를 포함할 것. 배경음악 검색 목적에 맞지 않는
+   일반 명사만으로 끝나는 검색어는 금지.
+6. 실존 가수, 밴드, 특정 영화/드라마/게임 제목, 특정 곡 제목은 절대 포함하지 말 것
+   (저작권·검색 결과 오염 방지).
+7. 검색어 길이는 공백 포함 한글 기준 8~20자 내외로 작성할 것 (너무 짧거나 장황하지 않게).
+
+[출력 형식 - 절대 규칙]
+8. 출력은 오직 '검색어' 한 줄(텍스트)만 작성할 것.
+9. 마침표, 쉼표, 따옴표, 괄호, 이모지, 특수기호, 부가 설명, 줄바꿈은 일절 금지.
+10. "검색어:", "추천:" 같은 접두어나 라벨을 붙이지 말 것. 검색어 자체만 출력할 것.
+11. 위 규칙 중 하나라도 어길 바에는, 규칙을 지키는 가장 무난한 검색어로 대체할 것.
+
+[예시]
+사이버펑크 어두운 골목 긴장되는 BGM
+비오는 날 따뜻한 재즈 피아노 BGM
+전투 직전 긴장감 넘치는 오케스트라 OST
+이별의 아픔 담은 애절한 피아노 BGM`;
 
         const modelName = settings.model || 'gemini-3.5-flash';
         let generatedQuery = "";
@@ -430,15 +497,16 @@
     }
 
     // ===================================================================================
-    // [7] 말풍선 카운터 (버그 픽스 및 로직 유지)
+    // [7] 말풍선 카운터 (다이나믹 limit 적용)
     // ===================================================================================
     function handleChatTurnEnded(addedCount = 1) {
         if(!settings.autoSync) return;
 
+        const limit = settings.autoTurnLimit || 6;
         autoTurnCounter += addedCount;
         const autoBtn = UI.els['auto-btn'];
 
-        if (autoTurnCounter >= AUTO_TURN_THRESHOLD) {
+        if (autoTurnCounter >= limit) {
             if (autoBtn) autoBtn.innerText = `🤖 분석 중...`;
             autoTurnCounter = 0;
 
@@ -446,15 +514,18 @@
             autoSyncTimer = setTimeout(() => {
                 const btn = UI.els['sync-btn'];
                 if (btn && !btn.classList.contains('spinning')) {
-                    // 치명적 버그 수정: triggerAnalysis -> analyzeContextAndSearch()
+                    btn.classList.add('spinning');
                     analyzeContextAndSearch().then(() => {
-                        if (autoBtn && settings.autoSync) autoBtn.innerText = `🤖 Auto: ON (0/${AUTO_TURN_THRESHOLD})`;
+                        if (autoBtn && settings.autoSync) autoBtn.innerText = `🤖 Auto: ON (0/${limit})`;
+                        btn.classList.remove('spinning');
+                    }).catch(() => {
+                        btn.classList.remove('spinning');
                     });
                 }
             }, 1000);
 
         } else if (autoBtn) {
-            autoBtn.innerText = `🤖 Auto: ON (${autoTurnCounter}/${AUTO_TURN_THRESHOLD})`;
+            autoBtn.innerText = `🤖 Auto: ON (${autoTurnCounter}/${limit})`;
         }
     }
 
