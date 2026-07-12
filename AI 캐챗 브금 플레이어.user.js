@@ -3,7 +3,7 @@
 // @namespace    http://tampermonkey.net/
 // @author       나 이뤼붕과 젬민이쉑
 // @version      7.4
-// @description  캐챗 브금 자동/수동 플레이어 (대화 수집 4턴 최적화 및 3.1-flash-lite 모델 추가)
+// @description  캐챗 브금 자동/수동 플레이어 (대화 수집 4턴 최적화 및 3.1-flash-lite 모델 추가,자동 감지 턴수 지정가능)
 // @match        https://crack.wrtn.ai/*
 // @grant        GM_addStyle
 // @grant        GM_setValue
