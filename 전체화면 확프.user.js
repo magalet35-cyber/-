@@ -1,9 +1,8 @@
 // ==UserScript==
-// @name        전체화면 확프
+// @name         전체화면 확프
 // @namespace    http://tampermonkey.net/
-// @author       나 이뤼붕과 젬민이쉑
-// @version      2.0
-// @description  파폭으로 크랙하는데 주소창이랑 핸드폰 상태창 뜨는거 싫어서 만듬. 컴퓨터 F11 하는거랑 똑같음
+// @version      2.5
+// @description  키보드 여백 비율을 직접 조절하여 공중부양 및 겹침 현상 완벽 해결
 // @match        https://crack.wrtn.ai/stories/*/episodes/*
 // @match        https://crack.wrtn.ai/characters/*/chats/*
 // @grant        none
@@ -11,6 +10,15 @@
 
 (function() {
     'use strict';
+
+    // ==========================================
+    // ⚙️ [여백 조절 설정] 
+    // 키보드 위 하얀 여백이 너무 넓으면 숫자를 줄이고, 
+    // 입력창이 키보드에 가려지면 숫자를 늘려보세요!
+    // (예: 0.75, 0.5, 0.3 등)
+    // ==========================================
+    const GAP_RATIO = 0.15; 
+    // ==========================================
 
     // 전체화면 토글 함수
     const toggleFullscreen = (e) => {
@@ -26,38 +34,28 @@
         }
     };
 
-    // 버튼 삽입 함수 (두 번째 스크립트 방식)
+    // 툴바 버튼 삽입 함수
     function injectFullscreenButton() {
-        // 이미 버튼이 존재하면 중지
-        if (document.getElementById('fullscreen-toolbar-btn')) {
-            return;
-        }
+        if (document.getElementById('fullscreen-toolbar-btn')) return;
 
-        // 버튼이 들어갈 툴바 컨테이너 찾기
         const btnContainer = document.querySelector('.flex.items-center.space-x-2');
         if (!btnContainer) return;
 
-        // 기준이 되는 기존 버튼들 찾기
         const recommendBtn = Array.from(btnContainer.querySelectorAll('button')).find(b => b.textContent && b.textContent.includes('추천답변'));
         const hlpBtn = document.getElementById('hlp-toolbar-btn');
         const plBtn = document.getElementById('txt-palette-toolbar-btn');
-        const capBtn = document.getElementById('cap-toolbar-btn'); // 캡처기 버튼이 있다면 그 옆에 배치
+        const capBtn = document.getElementById('cap-toolbar-btn');
 
-        // 버튼 요소 생성
         const fsBtn = document.createElement('button');
         fsBtn.id = 'fullscreen-toolbar-btn';
-        // 뤼튼 기본 UI 버튼과 동일한 클래스 적용
         fsBtn.className = "relative inline-flex items-center gap-1 rounded-full text-sm font-medium transition-colors border border-border bg-card text-line-gray-1 hover:bg-secondary p-0 size-7 justify-center ml-1";
-
-        // 현재 상태에 맞는 아이콘 렌더링
+        
         const currentIcon = document.fullscreenElement ? '✖' : '⛶';
         fsBtn.innerHTML = `<span title="전체화면 토글" style="font-size: 14px; margin-top: 1px;">${currentIcon}</span>`;
-
-        // 이벤트 바인딩
+        
         fsBtn.addEventListener('click', toggleFullscreen);
         fsBtn.addEventListener('touchstart', toggleFullscreen, { passive: false });
 
-        // 버튼 삽입 위치 결정 (다른 확장 프로그램 버튼들 우측에 배치)
         const targetBtn = capBtn || plBtn || hlpBtn || recommendBtn;
         if (targetBtn && targetBtn.parentNode) {
             if(targetBtn === recommendBtn) {
@@ -65,20 +63,48 @@
             } else {
                 targetBtn.parentNode.insertBefore(fsBtn, targetBtn.nextSibling);
             }
-        } else {
-            btnContainer.appendChild(fsBtn);
+        } else { 
+            btnContainer.appendChild(fsBtn); 
         }
     }
 
-    // 화면 상태에 따라 아이콘 모양 변경 이벤트
+    // ⭐️ V2.5: 사용자 맞춤형 투명 여백 비율 로직 ⭐️
+    function handleViewportResize() {
+        if (!window.visualViewport) return;
+        
+        if (document.fullscreenElement) {
+            const kbHeight = window.innerHeight - window.visualViewport.height;
+            
+            if (kbHeight > 50) {
+                // GAP_RATIO를 곱해서 여백의 양을 유동적으로 줄입니다.
+                document.body.style.paddingBottom = `${kbHeight * GAP_RATIO}px`;
+                
+                setTimeout(() => {
+                    const activeEl = document.activeElement;
+                    if (activeEl && (activeEl.tagName === 'TEXTAREA' || activeEl.tagName === 'INPUT')) {
+                        activeEl.scrollIntoView({ behavior: 'smooth', block: 'nearest' });
+                    }
+                }, 100);
+            } else {
+                document.body.style.paddingBottom = '0px';
+            }
+        } else {
+            document.body.style.paddingBottom = '';
+        }
+    }
+
+    if (window.visualViewport) {
+        window.visualViewport.addEventListener('resize', handleViewportResize);
+    }
+
     document.addEventListener('fullscreenchange', () => {
         const btnSpan = document.querySelector('#fullscreen-toolbar-btn span');
         if (btnSpan) {
             btnSpan.innerHTML = document.fullscreenElement ? '✖' : '⛶';
         }
+        handleViewportResize();
     });
 
-    // 뤼튼 특성상 React 기반이라 화면 전환 및 렌더링이 동적이므로 0.5초마다 버튼 유무 체크 후 주입
     setInterval(injectFullscreenButton, 500);
 
 })();
