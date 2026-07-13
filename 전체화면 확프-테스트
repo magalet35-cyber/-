@@ -1,0 +1,142 @@
+// ==UserScript==
+// @name         전체화면 확프-테스트
+// @namespace    http://tampermonkey.net/
+// @version      3.0
+// @description  핸드폰(2.5방식)과 패드(이벤트 캡처링)의 장점만 결합한 최종 호환 버전
+// @match        https://crack.wrtn.ai/stories/*/episodes/*
+// @match        https://crack.wrtn.ai/characters/*/chats/*
+// @grant        none
+// ==/UserScript==
+
+(function() {
+    'use strict';
+
+    // ==========================================
+    // ⚙️ [여백 맞춤 설정] 
+    // 기기에 맞게 아래 숫자를 조절할 수 있습니다.
+    // ==========================================
+    const PHONE_GAP_RATIO = 0.4;  // 핸드폰용 여백 비율 (2.5버전과 동일)
+    const TABLET_GAP_VH = '35vh'; // 태블릿용 고정 여백 (화면의 35%)
+    // ==========================================
+
+    // 전체화면 토글 함수
+    const toggleFullscreen = (e) => {
+        e.preventDefault();
+        if (!document.fullscreenElement) {
+            if (document.documentElement.requestFullscreen) {
+                document.documentElement.requestFullscreen().catch(console.error);
+            }
+        } else {
+            if (document.exitFullscreen) {
+                document.exitFullscreen().catch(console.error);
+            }
+        }
+    };
+
+    // 툴바 버튼 삽입 함수
+    function injectFullscreenButton() {
+        if (document.getElementById('fullscreen-toolbar-btn')) return;
+
+        const btnContainer = document.querySelector('.flex.items-center.space-x-2');
+        if (!btnContainer) return;
+
+        const recommendBtn = Array.from(btnContainer.querySelectorAll('button')).find(b => b.textContent && b.textContent.includes('추천답변'));
+        const capBtn = document.getElementById('cap-toolbar-btn');
+
+        const fsBtn = document.createElement('button');
+        fsBtn.id = 'fullscreen-toolbar-btn';
+        fsBtn.className = "relative inline-flex items-center gap-1 rounded-full text-sm font-medium transition-colors border border-border bg-card text-line-gray-1 hover:bg-secondary p-0 size-7 justify-center ml-1";
+        
+        const currentIcon = document.fullscreenElement ? '✖' : '⛶';
+        fsBtn.innerHTML = `<span title="전체화면 토글" style="font-size: 14px; margin-top: 1px;">${currentIcon}</span>`;
+        
+        fsBtn.addEventListener('click', toggleFullscreen);
+        fsBtn.addEventListener('touchstart', toggleFullscreen, { passive: false });
+
+        const targetBtn = capBtn || recommendBtn;
+        if (targetBtn && targetBtn.parentNode) {
+            if(targetBtn === recommendBtn) {
+                targetBtn.parentNode.insertBefore(fsBtn, targetBtn);
+            } else {
+                targetBtn.parentNode.insertBefore(fsBtn, targetBtn.nextSibling);
+            }
+        } else { 
+            btnContainer.appendChild(fsBtn); 
+        }
+    }
+
+    // ⭐️ V3.0: 듀얼 엔진 레이아웃 업데이트 함수 ⭐️
+    function updateLayout() {
+        if (!document.fullscreenElement) {
+            document.body.style.paddingBottom = '';
+            return;
+        }
+
+        // 현재 터치된(활성화된) 요소 확인
+        const active = document.activeElement;
+        const isInput = active && (active.tagName === 'TEXTAREA' || active.tagName === 'INPUT');
+        
+        // 1. 브라우저가 알려주는 높이 차이 계산
+        let kbHeight = 0;
+        if (window.visualViewport) {
+            kbHeight = window.innerHeight - window.visualViewport.height;
+        }
+
+        // 2. 듀얼 분기점 처리
+        if (kbHeight > 50) {
+            // [핸드폰] 화면이 정상적으로 줄어든 경우 (2.5 버전 로직)
+            document.body.style.paddingBottom = `${kbHeight * PHONE_GAP_RATIO}px`;
+        } else if (isInput) {
+            // [태블릿] 화면 높이는 안 줄어들었는데 입력창이 눌린 경우 (버그 우회)
+            document.body.style.paddingBottom = TABLET_GAP_VH; 
+        } else {
+            // 키보드가 내려간 평상시 상태
+            document.body.style.paddingBottom = '0px';
+        }
+    }
+
+    // 화면 크기가 변할 때 (주로 핸드폰에서 반응)
+    if (window.visualViewport) {
+        window.visualViewport.addEventListener('resize', () => {
+            updateLayout();
+            // 화면이 줄어들면 입력창을 중앙으로 부드럽게 가져옴
+            setTimeout(() => {
+                const active = document.activeElement;
+                if (active && (active.tagName === 'TEXTAREA' || active.tagName === 'INPUT')) {
+                    active.scrollIntoView({ behavior: 'smooth', block: 'center' });
+                }
+            }, 100);
+        });
+    }
+
+    // 🚨 핵심 포인트: 뤼튼이 차단하기 전에 '캡처링(true)'으로 터치 신호 빼앗아오기 (태블릿용)
+    document.addEventListener('focus', (e) => {
+        const isInput = e.target.tagName === 'TEXTAREA' || e.target.tagName === 'INPUT';
+        if (isInput && document.fullscreenElement) {
+            setTimeout(updateLayout, 50);
+            setTimeout(() => {
+                e.target.scrollIntoView({ behavior: 'smooth', block: 'center' });
+            }, 150);
+        }
+    }, true); 
+
+    // 입력창에서 빠져나올 때
+    document.addEventListener('blur', (e) => {
+        const isInput = e.target.tagName === 'TEXTAREA' || e.target.tagName === 'INPUT';
+        if (isInput && document.fullscreenElement) {
+            setTimeout(updateLayout, 50);
+        }
+    }, true);
+
+    // 전체화면 상태 변경 시 아이콘 변경 및 레이아웃 갱신
+    document.addEventListener('fullscreenchange', () => {
+        const btnSpan = document.querySelector('#fullscreen-toolbar-btn span');
+        if (btnSpan) {
+            btnSpan.innerHTML = document.fullscreenElement ? '✖' : '⛶';
+        }
+        updateLayout();
+    });
+
+    setInterval(injectFullscreenButton, 500);
+
+})();
