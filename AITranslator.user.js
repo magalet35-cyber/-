@@ -1,8 +1,8 @@
 // ==UserScript==
 // @name         AI 캐릭터 맞춤 번역기
 // @namespace    http://tampermonkey.net/
-// @version      3.8
-// @description  번역 기능 ON/OFF 토글 추가 (한국어 전용 윤문/교정 모드 지원)
+// @version      3.9
+// @description  목표 언어 선택창 UI 레이아웃 버그 수정
 // @match        https://crack.wrtn.ai/*
 // @grant        GM_addStyle
 // @grant        GM_setValue
@@ -255,7 +255,7 @@
 
             panel.innerHTML = `
                 <div class="ai-panel-header" id="ai-panel-drag">
-                    <span>🌐 번역 설정 (V3.8)</span>
+                    <span>🌐 번역 설정 (V3.9)</span>
                     <span class="ai-panel-close" id="ai-panel-close">✕</span>
                 </div>
                 <div class="ai-tabs">
@@ -289,7 +289,6 @@
                         <input type="text" id="cfg-custom-lang" class="ai-input" placeholder="예: Polish, Swahili...">
                     </div>
 
-                    <!-- 🔥 3.8 추가: 번역 기능 ON/OFF 토글 스위치 -->
                     <div class="ai-form-group" style="background: rgba(165,180,252,.1); padding: 8px 10px; border-radius: 8px; border: 1px solid rgba(165,180,252,.2); margin-top: 4px; display: flex; flex-direction: column; gap: 8px;">
                         <label class="toggle-label" style="color: #10b981;" title="끄면 번역 없이 한국어로만 문장/말투를 다듬어 줍니다.">
                             <input type="checkbox" id="cfg-translate" style="margin: 0;"> 🌐 외국어 번역 기능 켜기
@@ -426,10 +425,10 @@
             selProvider.addEventListener('change', toggleProviderUI);
             toggleProviderUI();
 
-            // 🔥 번역 기능 켜고 끄기에 따라 목표 언어/형식 입력칸 숨기기
+            // 🔥 버그 수정: flex -> block으로 변경하여 가로 정렬 문제 해결
             const toggleTranslationUI = () => {
                 const isTrans = chkTranslate.checked;
-                document.getElementById('group-lang').style.display = isTrans ? 'flex' : 'none';
+                document.getElementById('group-lang').style.display = isTrans ? 'block' : 'none';
                 document.getElementById('group-format').style.display = isTrans ? 'block' : 'none';
                 
                 const isCustom = selLang.value === '__custom__';
@@ -577,7 +576,6 @@
         icon.innerText = '⏳';
         icon.classList.add('spin-icon');
         
-        // 토스트 메시지도 상태에 따라 다르게 표시
         if (settings.useTranslation) {
             toast('AI가 번역 및 교정 중...', 'info');
         } else {
@@ -607,7 +605,6 @@
         sysPrompt += `[RULES]\n`;
         
         if (settings.useTranslation) {
-            // ================== 번역 모드 (ON) ==================
             if (settings.usePolish) {
                 sysPrompt += `1. REWRITE & POLISH: Completely rewrite the user's rough Korean input. First, rearrange the sequence of actions (text wrapped in *) and spoken dialogue to create the most natural and dramatic flow. Fix the character's tone of voice to perfectly match their Persona and the Context. Expand and polish the narrative into a high-quality web novel style in KOREAN.\n`;
                 sysPrompt += `2. TRANSLATE: Translate the polished Korean dialogue into ${lang}. DO NOT translate the narrative (*).\n`;
@@ -624,7 +621,6 @@
                 }
             }
         } else {
-            // ================== 한국어 교정 전용 모드 (번역 OFF) ==================
             sysPrompt += `1. NO TRANSLATION: Keep EVERYTHING (both narrative and dialogue) in KOREAN. Do not translate to foreign languages.\n`;
             if (settings.usePolish) {
                 sysPrompt += `2. REWRITE & POLISH: Completely rewrite the user's rough Korean input. Rearrange actions (wrapped in *) and dialogue for the most natural, dramatic flow. Fix the character's tone to perfectly match their Persona and Context. Expand the narrative into a high-quality web novel style.\n`;
@@ -651,7 +647,7 @@
                 sysPrompt += `Example Output: *의심스러운 기색을 지우지 못한 채, 그녀는 조심스레 블루의 손을 꾹 그러잡았다.* 아버지가 당장 돈을 보내실 리가 없잖아요. *선택의 여지가 없다는 듯 짧은 한숨을 내쉬며 묻는다.* 근데... 어디로 가실 건데요?\n`;
             } else {
                 sysPrompt += `Example Input: *창밖을 보며* 안녕, 반가워!\n`;
-                sysPrompt += `Example Output: *창밖을 보며* 안녕, 정말 반갑네!\n`; // 페르소나 적용된 예시
+                sysPrompt += `Example Output: *창밖을 보며* 안녕, 정말 반갑네!\n`;
             }
         }
 
