@@ -1,11 +1,9 @@
 // ==UserScript==
-// @name         AI 캐릭터 맞춤 번역기 
+// @name         AI 캐릭터 맞춤 번역기
 // @namespace    http://tampermonkey.net/
-// @version      3.7.2.
-// @description  출력 글자 수 제어(Limit) + DOM Observer/Theme 리플로우 최적화 + 모듈 캐싱 적용
+// @version      3.8
+// @description  번역 기능 ON/OFF 토글 추가 (한국어 전용 윤문/교정 모드 지원)
 // @match        https://crack.wrtn.ai/*
-// @updateURL    https://githubusercontent.com
-// @downloadURL  https://githubusercontent.com
 // @grant        GM_addStyle
 // @grant        GM_setValue
 // @grant        GM_getValue
@@ -18,45 +16,31 @@
     'use strict';
 
     // ===================================================================================
-    // [상태 관리 및 설정]
+    // [상태 관리]
     // ===================================================================================
     const DEFAULT_FORMAT = '{번역문} ({원문})';
-    const DEFAULT_SETTINGS = {
-        provider: 'google', apiKey: '', firebaseConfig: '', model: 'gemini-3.5-flash',
-        lang: 'English', customLang: '', format: DEFAULT_FORMAT, activeChar: '',
-        useContext: true, usePolish: false, maxLength: 1000
-    };
 
-    function safeParseObject(raw, fallback) {
-        try {
-            const parsed = JSON.parse(raw);
-            return (parsed && typeof parsed === 'object') ? parsed : fallback;
-        } catch (e) {
-            return fallback;
-        }
-    }
-
-    let characters = safeParseObject(GM_getValue('AITrans_chars', '{}'), {});
-    let settings = Object.assign({}, DEFAULT_SETTINGS, safeParseObject(GM_getValue('AITrans_settings', '{}'), {}));
+    let characters = JSON.parse(GM_getValue('AITrans_chars', '{}'));
+    let settings = JSON.parse(GM_getValue('AITrans_settings', 
+        '{"provider":"google","apiKey":"","firebaseConfig":"","model":"gemini-3.5-flash","lang":"English","customLang":"","format":"' + DEFAULT_FORMAT.replace(/"/g, '\\"') + '","activeChar":"","useContext":true,"usePolish":false,"maxLength":1000,"useTranslation":true}'
+    ));
+    
+    if (settings.format === undefined) settings.format = DEFAULT_FORMAT;
+    if (settings.customLang === undefined) settings.customLang = '';
+    if (settings.useContext === undefined) settings.useContext = true;
+    if (settings.usePolish === undefined) settings.usePolish = false;
+    if (settings.maxLength === undefined) settings.maxLength = 1000;
+    if (settings.useTranslation === undefined) settings.useTranslation = true;
 
     function saveSettings() { GM_setValue('AITrans_settings', JSON.stringify(settings)); }
     function saveChars() { GM_setValue('AITrans_chars', JSON.stringify(characters)); }
 
     // ===================================================================================
-    // [DOM 캐시 및 상태]
-    // ===================================================================================
-    let panelEl = null;
-    let inlineGroupEl = null;
-    let firebaseModules = null; // 모듈 캐싱 (성능 최적화)
-    let firebaseAppInstance = null; // 앱 인스턴스 캐싱
-
-    // ===================================================================================
-    // [테마 감지 최적화] - 리플로우(Reflow) 제거
+    // [테마 감지]
     // ===================================================================================
     function isDarkTheme() {
         const html = document.documentElement;
         const body = document.body;
-        // 강제 렌더링을 유발하는 getComputedStyle 삭제. 속성 기반으로만 초고속 감지
         const hints = [
             html.getAttribute('data-theme'), html.getAttribute('data-color-mode'), html.className,
             body?.getAttribute('data-theme'), body?.getAttribute('data-color-mode'), body?.className
@@ -65,18 +49,29 @@
         if (/\bdark\b|theme-dark|dark-mode|darkmode|color-scheme-dark/.test(hints)) return true;
         if (/\blight\b|theme-light|light-mode|lightmode|color-scheme-light/.test(hints)) return false;
 
+        try {
+            const probe = document.createElement('span');
+            probe.style.cssText = 'position:fixed;left:-9999px;color:var(--text_primary, var(--foreground, inherit));';
+            document.documentElement.appendChild(probe);
+            const rgb = getComputedStyle(probe).color.match(/\d+/g);
+            probe.remove();
+            if (rgb && rgb.length >= 3) {
+                const lum = (0.2126 * rgb[0] + 0.7152 * rgb[1] + 0.0722 * rgb[2]) / 255;
+                if (lum > 0.58) return true;
+                if (lum < 0.42) return false;
+            }
+        } catch (e) {}
+
         return window.matchMedia?.('(prefers-color-scheme: dark)')?.matches || false;
     }
 
     function applyAitTheme() {
-        if (!panelEl && !inlineGroupEl) return;
         const theme = isDarkTheme() ? 'dark' : 'light';
-        if (panelEl) panelEl.setAttribute('data-ait-theme', theme);
-        if (inlineGroupEl) inlineGroupEl.setAttribute('data-ait-theme', theme);
+        document.getElementById('ai-trans-panel')?.setAttribute('data-ait-theme', theme);
+        document.getElementById('ai-trans-inline-group')?.setAttribute('data-ait-theme', theme);
     }
 
     function setReactValue(el, value) {
-        if (!el) return;
         if (el.isContentEditable) {
             el.innerText = value;
             el.dispatchEvent(new Event("input", { bubbles: true }));
@@ -106,22 +101,19 @@
             z-index:999999; background:rgba(20,22,30,.94); color:#eceef6;
             padding:10px 16px; border-radius:10px; font-size:12px; font-weight:bold;
             border:1px solid rgba(205,216,255,.16); border-left:3px solid ${palette[type]||palette.info};
-            box-shadow:0 8px 24px rgba(0,0,0,.4); transition:opacity .4s ease-out; white-space:nowrap;
-            backdrop-filter:blur(10px); -webkit-backdrop-filter:blur(10px); pointer-events:none;
+            box-shadow:0 8px 24px rgba(0,0,0,.4); transition:opacity .4s; white-space:nowrap;
+            backdrop-filter:blur(10px); -webkit-backdrop-filter:blur(10px);
         `;
         document.body.appendChild(el);
-        // 리플로우 억제를 위해 약간의 지연 후 타이머 설정
-        requestAnimationFrame(() => {
-            setTimeout(() => {
-                el.style.opacity = "0";
-                setTimeout(() => el.remove(), 400);
-            }, 3000);
-        });
+        setTimeout(() => { el.style.opacity="0"; setTimeout(()=>el.remove(),400); }, 3000);
     }
 
-    // 스타일 정의 생략 없이 포함 (원문과 동일)
+    // ===================================================================================
+    // [스타일 정의]
+    // ===================================================================================
     GM_addStyle(`
         #ai-trans-inline-group { display: flex; align-items: center; gap: 5px; margin-right: 8px; }
+
         .trans-action-btn, .trans-setting-btn {
             height: 2rem; width: 2rem; border-radius: 999px; padding: 0;
             font-size: 14px; cursor: pointer; transition: background .15s ease, transform .15s ease;
@@ -225,16 +217,12 @@
     // [설정 값 파싱]
     // ===================================================================================
     const LANGUAGES = [
-        { value: 'English', label: '영어' }, { value: 'Japanese', label: '일본어' },
-        { value: 'Chinese (Simplified)', label: '중국어 간체' }, { value: 'Chinese (Traditional)', label: '중국어 번체' },
-        { value: 'Russian', label: '러시아어' }, { value: '__custom__', label: '직접 입력…' }
-    ];
-
-    const GOOGLE_SAFETY_SETTINGS = [
-        { category: "HARM_CATEGORY_HATE_SPEECH", threshold: "BLOCK_NONE" },
-        { category: "HARM_CATEGORY_SEXUALLY_EXPLICIT", threshold: "BLOCK_NONE" },
-        { category: "HARM_CATEGORY_HARASSMENT", threshold: "BLOCK_NONE" },
-        { category: "HARM_CATEGORY_DANGEROUS_CONTENT", threshold: "BLOCK_NONE" }
+        { value: 'English', label: '영어' },
+        { value: 'Japanese', label: '일본어' },
+        { value: 'Chinese (Simplified)', label: '중국어 간체' },
+        { value: 'Chinese (Traditional)', label: '중국어 번체' },
+        { value: 'Russian', label: '러시아어' },
+        { value: '__custom__', label: '직접 입력…' }
     ];
 
     function getTargetLang() {
@@ -267,23 +255,21 @@
 
             panel.innerHTML = `
                 <div class="ai-panel-header" id="ai-panel-drag">
-                    <span>🌐 번역 설정 (V3.7.opt)</span>
+                    <span>🌐 번역 설정 (V3.8)</span>
                     <span class="ai-panel-close" id="ai-panel-close">✕</span>
                 </div>
                 <div class="ai-tabs">
                     <div class="ai-tab active" data-target="tab-main">기본 설정</div>
                     <div class="ai-tab" data-target="tab-chars">캐릭터 보관함</div>
                 </div>
+
                 <div class="ai-content active" id="tab-main">
                     <div class="ai-form-group">
                         <label>적용할 캐릭터</label>
                         <select id="cfg-char" class="ai-input"><option value="">선택 안 함</option></select>
                     </div>
+                    
                     <div style="display:flex; gap:6px;">
-                        <div class="ai-form-group" style="flex:1;">
-                            <label>목표 언어</label>
-                            <select id="cfg-lang" class="ai-input">${langOptions}</select>
-                        </div>
                         <div class="ai-form-group" style="flex:1;">
                             <label>사용 모델</label>
                             <select id="cfg-model" class="ai-input">
@@ -292,12 +278,22 @@
                                 <option value="gemini-3.1-pro-preview">3.1 Pro</option>
                             </select>
                         </div>
+                        <div class="ai-form-group" style="flex:1;" id="group-lang">
+                            <label>목표 언어</label>
+                            <select id="cfg-lang" class="ai-input">${langOptions}</select>
+                        </div>
                     </div>
+
                     <div class="ai-form-group" id="group-custom-lang" style="display:none;">
                         <label>목표 언어 직접 입력</label>
                         <input type="text" id="cfg-custom-lang" class="ai-input" placeholder="예: Polish, Swahili...">
                     </div>
+
+                    <!-- 🔥 3.8 추가: 번역 기능 ON/OFF 토글 스위치 -->
                     <div class="ai-form-group" style="background: rgba(165,180,252,.1); padding: 8px 10px; border-radius: 8px; border: 1px solid rgba(165,180,252,.2); margin-top: 4px; display: flex; flex-direction: column; gap: 8px;">
+                        <label class="toggle-label" style="color: #10b981;" title="끄면 번역 없이 한국어로만 문장/말투를 다듬어 줍니다.">
+                            <input type="checkbox" id="cfg-translate" style="margin: 0;"> 🌐 외국어 번역 기능 켜기
+                        </label>
                         <label class="toggle-label" style="color: #818cf8;">
                             <input type="checkbox" id="cfg-context" style="margin: 0;"> 🧠 대화 맥락 읽고 뉘앙스 반영하기
                         </label>
@@ -305,8 +301,9 @@
                             <input type="checkbox" id="cfg-polish" style="margin: 0;"> ✨ 서술 윤문 + 말투/대사 순서 자동 교정
                         </label>
                     </div>
+
                     <div style="display:flex; gap:6px; margin-top: 10px;">
-                        <div class="ai-form-group" style="flex:1;">
+                        <div class="ai-form-group" id="group-format" style="flex:1;">
                             <label>출력 형식</label>
                             <textarea id="cfg-format" class="ai-input" style="min-height:30px; height:34px;" placeholder="${DEFAULT_FORMAT}"></textarea>
                         </div>
@@ -315,6 +312,7 @@
                             <input type="number" id="cfg-max-length" class="ai-input" value="1000" min="100" max="5000" step="100" style="height:34px;">
                         </div>
                     </div>
+
                     <div class="ai-form-group" style="margin-top: 5px;">
                         <label>API 제공자</label>
                         <select id="cfg-provider" class="ai-input">
@@ -322,16 +320,20 @@
                             <option value="firebase">Firebase Vertex AI</option>
                         </select>
                     </div>
+
                     <div class="ai-form-group" id="group-api-key">
                         <label>API 키</label>
                         <input type="password" id="cfg-key" class="ai-input" placeholder="Google API Key 입력">
                     </div>
+
                     <div class="ai-form-group" id="group-firebase" style="display:none;">
                         <label>Firebase 설정</label>
                         <textarea id="cfg-firebase" class="ai-input" placeholder="firebaseConfig = { ... }; 형식의 스크립트 입력"></textarea>
                     </div>
+
                     <button class="ai-btn-full" id="btn-save-cfg">설정 저장</button>
                 </div>
+
                 <div class="ai-content" id="tab-chars">
                     <div class="ai-form-group"><label>이름</label><input type="text" id="ch-name" class="ai-input" placeholder="캐릭터 이름"></div>
                     <div style="display:flex; gap:6px;">
@@ -347,9 +349,7 @@
                 </div>
             `;
             document.body.appendChild(panel);
-            panelEl = panel;
 
-            // 드래그 로직 (이벤트 위임/최적화 반영)
             const dragHandle = document.getElementById('ai-panel-drag');
             let isDragging = false, startX, startY, initLeft, initTop;
 
@@ -363,13 +363,13 @@
             };
             const dragMove = (e) => {
                 if (!isDragging) return;
-                if (e.cancelable) e.preventDefault(); // 스크롤 방지
+                e.preventDefault();
                 const evt = e.touches ? e.touches[0] : e;
                 panel.style.left = Math.max(0, initLeft + (evt.clientX - startX)) + 'px';
                 panel.style.top = Math.max(0, initTop + (evt.clientY - startY)) + 'px';
                 panel.style.right = 'auto';
             };
-            const dragEnd = () => { isDragging = false; };
+            const dragEnd = () => isDragging = false;
 
             dragHandle.addEventListener('mousedown', dragStart);
             document.addEventListener('mousemove', dragMove, { passive: false });
@@ -381,7 +381,7 @@
         },
 
         bindEvents() {
-            document.getElementById('ai-panel-close').onclick = () => { panelEl.style.display = 'none'; };
+            document.getElementById('ai-panel-close').onclick = () => document.getElementById('ai-trans-panel').style.display = 'none';
 
             document.querySelectorAll('.ai-tab').forEach(tab => {
                 tab.onclick = (e) => {
@@ -394,6 +394,10 @@
 
             const selProvider = document.getElementById('cfg-provider');
             const selLang = document.getElementById('cfg-lang');
+            const groupKey = document.getElementById('group-api-key');
+            const groupFb = document.getElementById('group-firebase');
+            const groupCustomLang = document.getElementById('group-custom-lang');
+            const chkTranslate = document.getElementById('cfg-translate');
 
             selProvider.value = settings.provider || 'google';
             document.getElementById('cfg-key').value = settings.apiKey || '';
@@ -401,36 +405,44 @@
             document.getElementById('cfg-model').value = settings.model || 'gemini-3.5-flash';
             document.getElementById('cfg-format').value = settings.format || DEFAULT_FORMAT;
             document.getElementById('cfg-custom-lang').value = settings.customLang || '';
-            document.getElementById('cfg-context').checked = settings.useContext;
+            document.getElementById('cfg-context').checked = settings.useContext; 
             document.getElementById('cfg-polish').checked = settings.usePolish;
             document.getElementById('cfg-max-length').value = settings.maxLength || 1000;
+            chkTranslate.checked = settings.useTranslation;
 
             if (settings.lang && ![...selLang.options].some(o => o.value === settings.lang)) {
                 const opt = document.createElement('option');
-                opt.value = opt.textContent = settings.lang;
+                opt.value = settings.lang;
+                opt.textContent = settings.lang;
                 selLang.insertBefore(opt, selLang.lastElementChild);
             }
             selLang.value = settings.lang || 'English';
 
             const toggleProviderUI = () => {
                 const isGoogle = selProvider.value === 'google';
-                document.getElementById('group-api-key').style.display = isGoogle ? 'block' : 'none';
-                document.getElementById('group-firebase').style.display = isGoogle ? 'none' : 'block';
+                groupKey.style.display = isGoogle ? 'block' : 'none';
+                groupFb.style.display = isGoogle ? 'none' : 'block';
             };
             selProvider.addEventListener('change', toggleProviderUI);
             toggleProviderUI();
 
-            const toggleCustomLangUI = () => {
-                document.getElementById('group-custom-lang').style.display = selLang.value === '__custom__' ? 'block' : 'none';
+            // 🔥 번역 기능 켜고 끄기에 따라 목표 언어/형식 입력칸 숨기기
+            const toggleTranslationUI = () => {
+                const isTrans = chkTranslate.checked;
+                document.getElementById('group-lang').style.display = isTrans ? 'flex' : 'none';
+                document.getElementById('group-format').style.display = isTrans ? 'block' : 'none';
+                
+                const isCustom = selLang.value === '__custom__';
+                groupCustomLang.style.display = (isTrans && isCustom) ? 'block' : 'none';
             };
-            selLang.addEventListener('change', toggleCustomLangUI);
-            toggleCustomLangUI();
+            chkTranslate.addEventListener('change', toggleTranslationUI);
+            selLang.addEventListener('change', toggleTranslationUI);
+            toggleTranslationUI();
 
             document.getElementById('btn-save-cfg').onclick = () => {
                 const fmt = document.getElementById('cfg-format').value.trim();
-                if (fmt && !fmt.includes('{번역문}')) return toast('출력 형식에 {번역문}이 반드시 포함돼야 해요', 'warn');
-
-                const previousFirebaseConfig = settings.firebaseConfig;
+                const isTrans = chkTranslate.checked;
+                if (isTrans && fmt && !fmt.includes('{번역문}')) return toast('출력 형식에 {번역문}이 반드시 포함돼야 해요', 'warn');
 
                 settings.provider = selProvider.value;
                 settings.apiKey = document.getElementById('cfg-key').value;
@@ -440,16 +452,12 @@
                 settings.customLang = document.getElementById('cfg-custom-lang').value.trim();
                 settings.format = fmt || DEFAULT_FORMAT;
                 settings.activeChar = document.getElementById('cfg-char').value;
-                settings.useContext = document.getElementById('cfg-context').checked;
+                settings.useContext = document.getElementById('cfg-context').checked; 
                 settings.usePolish = document.getElementById('cfg-polish').checked;
+                settings.useTranslation = isTrans;
                 settings.maxLength = parseInt(document.getElementById('cfg-max-length').value, 10) || 1000;
 
-                if (settings.lang === '__custom__' && !settings.customLang) return toast('직접 입력할 언어를 적어주세요', 'warn');
-
-                // Firebase 설정이 변경되면 인스턴스 초기화 유도
-                if (previousFirebaseConfig !== settings.firebaseConfig) {
-                    firebaseAppInstance = null;
-                }
+                if (isTrans && settings.lang === '__custom__' && !settings.customLang) return toast('직접 입력할 언어를 적어주세요', 'warn');
 
                 saveSettings();
                 toast('기본 설정 저장됨', 'success');
@@ -478,6 +486,7 @@
 
             Object.keys(characters).forEach(name => {
                 select.innerHTML += `<option value="${name}">${name}</option>`;
+
                 const item = document.createElement('div');
                 item.className = 'char-item';
                 item.innerHTML = `<span>${name}</span> <span class="char-del" data-name="${name}">✕</span>`;
@@ -521,12 +530,11 @@
             return bubbles.map(b => b.textContent.trim()).filter(Boolean).join('\n\n');
         }
         try {
-            const tokenMatch = document.cookie.match(/(?:^|;)\s*access_token=([^;]+)/);
-            if (!tokenMatch) return "";
+            const token = document.cookie.split(";").map((c) => c.trim()).find((c) => c.startsWith("access_token="))?.slice(13);
+            if (!token) return "";
             const res = await fetch(`https://crack-api.wrtn.ai/crack-gen/v3/chats/${path[2]}/messages?limit=4`, {
-                headers: { Authorization: `Bearer ${tokenMatch[1]}`, "Content-Type": "application/json" }
+                headers: { Authorization: `Bearer ${token}`, "Content-Type": "application/json" }
             });
-            if (!res.ok) return "";
             const json = await res.json();
             const msgs = (json.data ?? json).messages ?? [];
             return msgs.reverse().map(m => `[${m.role === "assistant" ? "상대방" : "나"}]: ${m.content}`).join("\n\n");
@@ -543,48 +551,13 @@
                 if (startIndex !== -1) {
                     const endIndex = scriptStr.indexOf("}", startIndex);
                     if (endIndex !== -1) {
-                        return new Function("return " + scriptStr.substring(startIndex + startText.length - 1, endIndex + 1))();
+                        const objStr = scriptStr.substring(startIndex + startText.length - 1, endIndex + 1);
+                        return new Function("return " + objStr)();
                     }
                 }
             }
         } catch(e) {}
         return null;
-    }
-
-    // 모듈 캐싱 적용된 Firebase 초기화
-    async function getFirebaseModel(sysPrompt) {
-        if (!firebaseModules) {
-            const [appModule, aiModule] = await Promise.all([
-                import("https://www.gstatic.com/firebasejs/12.8.0/firebase-app.js"),
-                import("https://www.gstatic.com/firebasejs/12.8.0/firebase-ai.js")
-            ]);
-            firebaseModules = { ...appModule, ...aiModule };
-        }
-
-        const config = parseVertexContent(settings.firebaseConfig);
-        if (!config) throw new Error("Firebase 스크립트 형식이 올바르지 않습니다.");
-
-        if (!firebaseAppInstance) {
-            try {
-                firebaseAppInstance = firebaseModules.initializeApp(config, "trans-ai-" + Date.now());
-            } catch(e) {
-                throw new Error("Firebase 초기화 실패: " + e.message);
-            }
-        }
-
-        const ai = firebaseModules.getAI(firebaseAppInstance, { backend: new firebaseModules.VertexAIBackend('global') });
-        const fSafety = [
-            { category: firebaseModules.HarmCategory.HARM_CATEGORY_HATE_SPEECH, threshold: firebaseModules.HarmBlockThreshold.OFF },
-            { category: firebaseModules.HarmCategory.HARM_CATEGORY_SEXUALLY_EXPLICIT, threshold: firebaseModules.HarmBlockThreshold.OFF },
-            { category: firebaseModules.HarmCategory.HARM_CATEGORY_HARASSMENT, threshold: firebaseModules.HarmBlockThreshold.OFF },
-            { category: firebaseModules.HarmCategory.HARM_CATEGORY_DANGEROUS_CONTENT, threshold: firebaseModules.HarmBlockThreshold.OFF }
-        ];
-
-        return firebaseModules.getGenerativeModel(ai, {
-            model: settings.model,
-            systemInstruction: sysPrompt,
-            safetySettings: fSafety
-        });
     }
 
     async function executeTranslation() {
@@ -594,7 +567,7 @@
         const isEditableDiv = inputEl.isContentEditable;
         const rawText = isEditableDiv ? inputEl.innerText : inputEl.value;
 
-        if (!rawText || !rawText.trim()) return toast('번역할 텍스트를 입력하세요', 'warn');
+        if (!rawText || !rawText.trim()) return toast('변환할 텍스트를 입력하세요', 'warn');
         if (settings.provider === 'google' && !settings.apiKey) return toast('설정창에서 Google API 키 입력 필요', 'error');
         if (settings.provider === 'firebase' && !settings.firebaseConfig) return toast('설정창에서 Firebase 스크립트 입력 필요', 'error');
 
@@ -603,15 +576,25 @@
         btn.disabled = true;
         icon.innerText = '⏳';
         icon.classList.add('spin-icon');
-        toast('AI가 번역 및 교정 중...', 'info');
+        
+        // 토스트 메시지도 상태에 따라 다르게 표시
+        if (settings.useTranslation) {
+            toast('AI가 번역 및 교정 중...', 'info');
+        } else {
+            toast('AI가 한국어 대사/서술 교정 중...', 'info');
+        }
 
-        let contextText = settings.useContext ? await getRecentContext() : "";
+        let contextText = "";
+        if (settings.useContext) {
+            contextText = await getRecentContext();
+        }
+
         const lang = getTargetLang();
         const { pattern, includesOriginal } = buildFormatInstruction();
         const maxLength = settings.maxLength || 1000;
 
-        let sysPrompt = `You are a specialized RP translator and master editor. Process the user's input based on the rules.\n`;
-
+        let sysPrompt = `You are a specialized RP writer and master editor. Process the user's input based on the rules.\n`;
+        
         if (contextText) {
             sysPrompt += `\n[Recent Conversation Context]\n${contextText}\n\n*CRITICAL: Use the context ONLY to understand the situation, relationship, and tone. DO NOT translate or repeat the context.*\n\n`;
         }
@@ -622,40 +605,93 @@
         }
 
         sysPrompt += `[RULES]\n`;
-
-        if (settings.usePolish) {
-            sysPrompt += `1. REWRITE & POLISH: Completely rewrite the user's rough Korean input. First, rearrange the sequence of actions (text wrapped in *) and spoken dialogue to create the most natural and dramatic flow. Fix the character's tone of voice to perfectly match their Persona and the Context. Expand and polish the narrative into a high-quality web novel style in KOREAN.\n`;
-            sysPrompt += `2. TRANSLATE: Translate the polished Korean dialogue into ${lang}. DO NOT translate the narrative (*).\n`;
-            sysPrompt += `3. FORMATTING: Output the final result. Keep narrative wrapped in *. For EVERY spoken dialogue, format it EXACTLY as: ${pattern}\n`;
-            if (includesOriginal) {
-                sysPrompt += `   *Note: For <ORIGINAL_KOREAN_DIALOGUE>, use your newly REWRITTEN/POLISHED Korean dialogue, NOT the user's raw input.\n`;
+        
+        if (settings.useTranslation) {
+            // ================== 번역 모드 (ON) ==================
+            if (settings.usePolish) {
+                sysPrompt += `1. REWRITE & POLISH: Completely rewrite the user's rough Korean input. First, rearrange the sequence of actions (text wrapped in *) and spoken dialogue to create the most natural and dramatic flow. Fix the character's tone of voice to perfectly match their Persona and the Context. Expand and polish the narrative into a high-quality web novel style in KOREAN.\n`;
+                sysPrompt += `2. TRANSLATE: Translate the polished Korean dialogue into ${lang}. DO NOT translate the narrative (*).\n`;
+                sysPrompt += `3. FORMATTING: Output the final result. Keep narrative wrapped in *. For EVERY spoken dialogue, format it EXACTLY as: ${pattern}\n`;
+                if (includesOriginal) {
+                    sysPrompt += `   *Note: For <ORIGINAL_KOREAN_DIALOGUE>, use your newly REWRITTEN/POLISHED Korean dialogue, NOT the user's raw input.\n`;
+                }
+            } else {
+                sysPrompt += `1. NARRATIVE: DO NOT translate or modify the Korean narrative (text wrapped in * or **). Keep it EXACTLY as the original Korean text. Wrap it in *.\n`;
+                sysPrompt += `2. DIALOGUE: Translate the spoken dialogue (text outside the asterisks) to ${lang}.\n`;
+                sysPrompt += `3. FORMATTING: Output the final result. Keep narrative wrapped in *. For EVERY spoken dialogue, format it EXACTLY as: ${pattern}\n`;
+                if (!includesOriginal) {
+                    sysPrompt += `   Do NOT append the original Korean dialogue.\n`;
+                }
             }
         } else {
-            sysPrompt += `1. NARRATIVE: DO NOT translate or modify the Korean narrative (text wrapped in * or **). Keep it EXACTLY as the original Korean text. Wrap it in *.\n`;
-            sysPrompt += `2. DIALOGUE: Translate the spoken dialogue (text outside the asterisks) to ${lang}.\n`;
-            sysPrompt += `3. FORMATTING: Output the final result. Keep narrative wrapped in *. For EVERY spoken dialogue, format it EXACTLY as: ${pattern}\n`;
-            if (!includesOriginal) sysPrompt += `   Do NOT append the original Korean dialogue.\n`;
+            // ================== 한국어 교정 전용 모드 (번역 OFF) ==================
+            sysPrompt += `1. NO TRANSLATION: Keep EVERYTHING (both narrative and dialogue) in KOREAN. Do not translate to foreign languages.\n`;
+            if (settings.usePolish) {
+                sysPrompt += `2. REWRITE & POLISH: Completely rewrite the user's rough Korean input. Rearrange actions (wrapped in *) and dialogue for the most natural, dramatic flow. Fix the character's tone to perfectly match their Persona and Context. Expand the narrative into a high-quality web novel style.\n`;
+            } else {
+                sysPrompt += `2. FIX TONE: Fix the spoken dialogue's tone to match the Character Persona. Keep the narrative (*) as it is without modifying it.\n`;
+            }
+            sysPrompt += `3. FORMATTING: Output the final Korean text directly. Keep the narrative wrapped in *. DO NOT use any translation format. Just output the natural text.\n`;
         }
 
-        sysPrompt += `4. LENGTH LIMIT: 🚨CRITICAL🚨 The TOTAL length of your final output MUST NOT exceed ${maxLength} characters.\n\n[EXAMPLES]\n`;
+        sysPrompt += `4. LENGTH LIMIT: 🚨CRITICAL🚨 The TOTAL length of your final output MUST NOT exceed ${maxLength} characters.\n`;
 
-        if (settings.usePolish) {
-            sysPrompt += `Example Raw Input: 아버지가 바로 돈을 보낼리가 없잖아요. *블루의 손을 잡는다.* 어디로 가실건데요?\nExample Output: *의심스러운 기색을 지우지 못한 채, 그녀는 조심스레 블루의 손을 꾹 그러잡았다.* My father wouldn't just send the money straight away. (아버지가 당장 돈을 보내실 리가 없잖아요.) *선택의 여지가 없다는 듯 묻는다.* But where exactly are we going? (근데... 어디로 가실 건데요?)\n`;
+        sysPrompt += `\n[EXAMPLES]\n`;
+        if (settings.useTranslation) {
+            if (settings.usePolish) {
+                sysPrompt += `Example Raw Input: 아버지가 바로 돈을 보낼리가 없잖아요. *블루의 손을 잡는다.* 어디로 가실건데요?\n`;
+                sysPrompt += `Example Output: *의심스러운 기색을 지우지 못한 채, 그녀는 조심스레 블루의 손을 꾹 그러잡았다.* My father wouldn't just send the money straight away. (아버지가 당장 돈을 보내실 리가 없잖아요.) *짧은 한숨을 내쉬며 묻는다.* But where exactly are we going? (근데... 어디로 가실 건데요?)\n`;
+            } else {
+                sysPrompt += `Example Input: *창밖을 보며* 안녕, 반가워!\n`;
+                sysPrompt += `Example Output: *창밖을 보며* Hello, nice to meet you! (안녕, 반가워!)\n`;
+            }
         } else {
-            sysPrompt += `Example Input: *창밖을 보며* 안녕, 반가워!\nExample Output: *창밖을 보며* Hello, nice to meet you! (안녕, 반가워!)\n`;
+            if (settings.usePolish) {
+                sysPrompt += `Example Raw Input: 아버지가 바로 돈을 보낼리가 없잖아요. *블루의 손을 잡는다.* 어디로 가실건데요?\n`;
+                sysPrompt += `Example Output: *의심스러운 기색을 지우지 못한 채, 그녀는 조심스레 블루의 손을 꾹 그러잡았다.* 아버지가 당장 돈을 보내실 리가 없잖아요. *선택의 여지가 없다는 듯 짧은 한숨을 내쉬며 묻는다.* 근데... 어디로 가실 건데요?\n`;
+            } else {
+                sysPrompt += `Example Input: *창밖을 보며* 안녕, 반가워!\n`;
+                sysPrompt += `Example Output: *창밖을 보며* 안녕, 정말 반갑네!\n`; // 페르소나 적용된 예시
+            }
         }
 
         try {
             let translatedText = "";
+            const safetySettings = [
+                { category: "HARM_CATEGORY_HATE_SPEECH", threshold: "BLOCK_NONE" },
+                { category: "HARM_CATEGORY_SEXUALLY_EXPLICIT", threshold: "BLOCK_NONE" },
+                { category: "HARM_CATEGORY_HARASSMENT", threshold: "BLOCK_NONE" },
+                { category: "HARM_CATEGORY_DANGEROUS_CONTENT", threshold: "BLOCK_NONE" }
+            ];
+
             if (settings.provider === 'firebase') {
-                const model = await getFirebaseModel(sysPrompt);
+                const config = parseVertexContent(settings.firebaseConfig);
+                if (!config) throw new Error("Firebase 스크립트 형식이 올바르지 않습니다.");
+
+                const { initializeApp } = await import("https://www.gstatic.com/firebasejs/12.8.0/firebase-app.js");
+                const { getAI, getGenerativeModel, VertexAIBackend, HarmBlockThreshold, HarmCategory } = await import("https://www.gstatic.com/firebasejs/12.8.0/firebase-ai.js");
+
+                let app;
+                try { app = initializeApp(config, "trans-ai-" + Date.now()); } catch(e) { throw new Error("Firebase 초기화 실패: " + e.message); }
+
+                const ai = getAI(app, { backend: new VertexAIBackend('global') });
+                const fSafety = [
+                    { category: HarmCategory.HARM_CATEGORY_HATE_SPEECH, threshold: HarmBlockThreshold.OFF },
+                    { category: HarmCategory.HARM_CATEGORY_SEXUALLY_EXPLICIT, threshold: HarmBlockThreshold.OFF },
+                    { category: HarmCategory.HARM_CATEGORY_HARASSMENT, threshold: HarmBlockThreshold.OFF },
+                    { category: HarmCategory.HARM_CATEGORY_DANGEROUS_CONTENT, threshold: HarmBlockThreshold.OFF }
+                ];
+
+                const model = getGenerativeModel(ai, { model: settings.model, systemInstruction: sysPrompt, safetySettings: fSafety });
                 const result = await model.generateContent(rawText);
-                translatedText = (await result.response).text().trim();
+                const response = await result.response;
+                translatedText = response.text().trim();
+
             } else {
                 const payloadData = {
                     system_instruction: { parts: [{ text: sysPrompt }] },
                     contents: [{ parts: [{ text: rawText }] }],
-                    safetySettings: GOOGLE_SAFETY_SETTINGS
+                    safetySettings: safetySettings
                 };
 
                 translatedText = await new Promise((resolve, reject) => {
@@ -667,16 +703,16 @@
                         onload: (res) => {
                             try {
                                 const data = JSON.parse(res.responseText);
-                                if (data.promptFeedback?.blockReason) throw new Error(`필터 차단됨`);
-                                if (data.candidates?.[0]) {
+                                if (data.promptFeedback && data.promptFeedback.blockReason) throw new Error(`필터 차단됨`);
+                                if (data.candidates && data.candidates.length > 0) {
                                     const cand = data.candidates[0];
                                     if (cand.finishReason === "SAFETY") throw new Error("안전 필터 차단됨");
-                                    if (!cand.content?.parts?.[0]) throw new Error("빈 텍스트 반환됨");
+                                    if (!cand.content || !cand.content.parts || cand.content.parts.length === 0) throw new Error("빈 텍스트 반환됨");
                                     resolve(cand.content.parts[0].text.trim());
-                                } else if (data.error) { throw new Error(`${data.error.message}`); }
+                                } else if (data.error) { throw new Error(`${data.error.message}`); } 
                                 else { throw new Error("결과값 없음"); }
                             } catch (e) {
-                                reject(e instanceof SyntaxError ? new Error('모델명/키 오류') : e);
+                                if (e instanceof SyntaxError) reject(new Error('모델명/키 오류')); else reject(e);
                             }
                         },
                         onerror: () => reject(new Error('네트워크 오류 (API/인터넷 확인)'))
@@ -685,7 +721,12 @@
             }
 
             setReactValue(inputEl, translatedText);
-            toast('번역 완료!', 'success');
+            
+            if (settings.useTranslation) {
+                toast('번역 완료!', 'success');
+            } else {
+                toast('한국어 문장 교정 완료!', 'success');
+            }
 
         } catch (error) {
             toast(`에러: ${error.message}`, 'error');
@@ -697,66 +738,41 @@
     }
 
     // ===================================================================================
-    // [UI 자동 주입 로직 및 최적화된 Observer]
+    // [UI 자동 주입 로직]
     // ===================================================================================
+    function findSendContainer() {
+        const toolbar = document.querySelector('.flex.items-center.space-x-2');
+        return toolbar || null;
+    }
+
     function injectButtons() {
-        const container = document.querySelector('.flex.items-center.space-x-2');
+        const container = findSendContainer();
         if (!container) return;
 
-        // 이미 정상적으로 연결되어 있다면 스킵
-        if (inlineGroupEl && inlineGroupEl.isConnected) return;
+        let wrapper = document.getElementById('ai-trans-inline-group');
+        if (!wrapper || !wrapper.isConnected) {
+            wrapper = document.createElement('div');
+            wrapper.id = 'ai-trans-inline-group';
+            wrapper.style.marginRight = '4px';
 
-        // 메모리 누수 방지: 만약 컨테이너가 달라졌다면 이전 DOM 참조 삭제
-        if (inlineGroupEl) {
-            inlineGroupEl.remove();
+            wrapper.innerHTML = `
+                <button id="ai-trans-btn" class="trans-action-btn" title="캐릭터 번역/교정"><span id="trans-icon">🌐</span></button>
+                <button id="ai-trans-cfg-btn" class="trans-setting-btn" title="설정">⚙️</button>
+            `;
+
+            container.insertBefore(wrapper, container.firstChild);
+
+            wrapper.querySelector('#ai-trans-btn').onclick = executeTranslation;
+            wrapper.querySelector('#ai-trans-cfg-btn').onclick = () => {
+                const p = document.getElementById('ai-trans-panel');
+                p.style.display = p.style.display === 'flex' ? 'none' : 'flex';
+                applyAitTheme();
+            };
         }
-
-        const wrapper = document.createElement('div');
-        wrapper.id = 'ai-trans-inline-group';
-        wrapper.style.marginRight = '4px';
-        wrapper.innerHTML = `
-            <button id="ai-trans-btn" class="trans-action-btn" title="캐릭터 번역"><span id="trans-icon">🌐</span></button>
-            <button id="ai-trans-cfg-btn" class="trans-setting-btn" title="설정">⚙️</button>
-        `;
-        container.insertBefore(wrapper, container.firstChild);
-
-        wrapper.querySelector('#ai-trans-btn').onclick = executeTranslation;
-        wrapper.querySelector('#ai-trans-cfg-btn').onclick = () => {
-            panelEl.style.display = panelEl.style.display === 'flex' ? 'none' : 'flex';
-            applyAitTheme();
-        };
-
-        inlineGroupEl = wrapper;
         applyAitTheme();
     }
 
-    // 하이브리드 디바운스: 브라우저 렌더링 프레임 단위로 부하 분산
-    let debounceTimer = null;
-    function scheduleInjectButtons() {
-        if (debounceTimer) return;
-        debounceTimer = setTimeout(() => {
-            debounceTimer = null;
-            requestAnimationFrame(injectButtons);
-        }, 300);
-    }
-
-    // 1. 바디 옵저버 (React DOM 변화 감지)
-    const bodyObserver = new MutationObserver(scheduleInjectButtons);
-    bodyObserver.observe(document.body, { childList: true, subtree: true });
-
-    // 2. 테마 감지 옵저버 (리플로우 없이 속성만 검사)
-    const themeObserver = new MutationObserver((mutations) => {
-        // 실제 테마 관련 클래스/속성이 변경된 경우만 반영
-        requestAnimationFrame(applyAitTheme);
-    });
-    const themeObserverOptions = { attributes: true, attributeFilter: ['class', 'data-theme', 'data-color-mode'] };
-    themeObserver.observe(document.documentElement, themeObserverOptions);
-    if (document.body) themeObserver.observe(document.body, themeObserverOptions);
-
     UI.init();
-    scheduleInjectButtons();
-
-    // 안전망 (기존처럼 너무 잦은 setInterval 대신 5초 유지하여 느슨하게 감시)
-    setInterval(scheduleInjectButtons, 5000);
+    setInterval(injectButtons, 1000);
 
 })();
