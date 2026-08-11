@@ -1,8 +1,8 @@
 // ==UserScript==
 // @name         AI 캐릭터 맞춤 번역기
 // @namespace    http://tampermonkey.net/
-// @version      3.9
-// @description  목표 언어 선택창 UI 레이아웃 버그 수정
+// @version      4.0
+// @description  억양(글자 늘어짐, 더듬음) 자동 반영 및 번역/교정 엔진 최적화
 // @match        https://crack.wrtn.ai/*
 // @grant        GM_addStyle
 // @grant        GM_setValue
@@ -255,7 +255,7 @@
 
             panel.innerHTML = `
                 <div class="ai-panel-header" id="ai-panel-drag">
-                    <span>🌐 번역 설정 (V3.9)</span>
+                    <span>🌐 번역 설정 (V4.0)</span>
                     <span class="ai-panel-close" id="ai-panel-close">✕</span>
                 </div>
                 <div class="ai-tabs">
@@ -425,7 +425,6 @@
             selProvider.addEventListener('change', toggleProviderUI);
             toggleProviderUI();
 
-            // 🔥 버그 수정: flex -> block으로 변경하여 가로 정렬 문제 해결
             const toggleTranslationUI = () => {
                 const isTrans = chkTranslate.checked;
                 document.getElementById('group-lang').style.display = isTrans ? 'block' : 'none';
@@ -630,25 +629,18 @@
             sysPrompt += `3. FORMATTING: Output the final Korean text directly. Keep the narrative wrapped in *. DO NOT use any translation format. Just output the natural text.\n`;
         }
 
-        sysPrompt += `4. LENGTH LIMIT: 🚨CRITICAL🚨 The TOTAL length of your final output MUST NOT exceed ${maxLength} characters.\n`;
+        // 🔥 4.0 추가: 억양 및 타이포그래피적 강조 반영 규칙
+        sysPrompt += `4. TYPOGRAPHICAL EMPHASIS (INTONATION): Pay close attention to elongated words, repeated vowels/consonants, or stuttering in the user's raw input (e.g., "좀 더더어어어ㅓ어엉", "안녀어어어엉"). You MUST replicate this exact same typographical emphasis, length, and emotional intensity in your final dialogue (e.g., "Mooooorooooeee", "Heeellloooo"). Do not clean up emotional elongation.\n`;
+
+        sysPrompt += `5. LENGTH LIMIT: 🚨CRITICAL🚨 The TOTAL length of your final output MUST NOT exceed ${maxLength} characters.\n`;
 
         sysPrompt += `\n[EXAMPLES]\n`;
         if (settings.useTranslation) {
-            if (settings.usePolish) {
-                sysPrompt += `Example Raw Input: 아버지가 바로 돈을 보낼리가 없잖아요. *블루의 손을 잡는다.* 어디로 가실건데요?\n`;
-                sysPrompt += `Example Output: *의심스러운 기색을 지우지 못한 채, 그녀는 조심스레 블루의 손을 꾹 그러잡았다.* My father wouldn't just send the money straight away. (아버지가 당장 돈을 보내실 리가 없잖아요.) *짧은 한숨을 내쉬며 묻는다.* But where exactly are we going? (근데... 어디로 가실 건데요?)\n`;
-            } else {
-                sysPrompt += `Example Input: *창밖을 보며* 안녕, 반가워!\n`;
-                sysPrompt += `Example Output: *창밖을 보며* Hello, nice to meet you! (안녕, 반가워!)\n`;
-            }
+            sysPrompt += `Example Raw Input: 아버지가 바로 돈을 보낼리가 없잖아요오오오. *블루의 손을 잡는다.* 어디로 가실건데요?\n`;
+            sysPrompt += `Example Output: *의심스러운 기색을 지우지 못한 채, 그녀는 조심스레 블루의 손을 꾹 그러잡았다.* My father wouldn't just send the money straight awayyyyy. (아버지가 당장 돈을 보내실 리가 없잖아요오오오.) *짧은 한숨을 내쉬며 묻는다.* But where exactly are we going? (근데... 어디로 가실 건데요?)\n`;
         } else {
-            if (settings.usePolish) {
-                sysPrompt += `Example Raw Input: 아버지가 바로 돈을 보낼리가 없잖아요. *블루의 손을 잡는다.* 어디로 가실건데요?\n`;
-                sysPrompt += `Example Output: *의심스러운 기색을 지우지 못한 채, 그녀는 조심스레 블루의 손을 꾹 그러잡았다.* 아버지가 당장 돈을 보내실 리가 없잖아요. *선택의 여지가 없다는 듯 짧은 한숨을 내쉬며 묻는다.* 근데... 어디로 가실 건데요?\n`;
-            } else {
-                sysPrompt += `Example Input: *창밖을 보며* 안녕, 반가워!\n`;
-                sysPrompt += `Example Output: *창밖을 보며* 안녕, 정말 반갑네!\n`;
-            }
+            sysPrompt += `Example Raw Input: 아니이이이! *화들짝 놀란다* 그게 무슨 소리야아아아!\n`;
+            sysPrompt += `Example Output: *눈을 동그랗게 뜨고 화들짝 놀라며 뒤로 물러선다.* 아니이이이! 그게 도대체 무슨 소리야아아아!\n`;
         }
 
         try {
