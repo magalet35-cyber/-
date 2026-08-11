@@ -4,6 +4,8 @@
 // @version      3.7.2.
 // @description  출력 글자 수 제어(Limit) + DOM Observer/Theme 리플로우 최적화 + 모듈 캐싱 적용
 // @match        https://crack.wrtn.ai/*
+// @updateURL    https://githubusercontent.com
+// @downloadURL  https://githubusercontent.com
 // @grant        GM_addStyle
 // @grant        GM_setValue
 // @grant        GM_getValue
