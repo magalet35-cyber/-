@@ -1,0 +1,1228 @@
+// ==UserScript==
+// @name         AI 대화 프로필 맞춤 번역기
+// @namespace    http://tampermonkey.net/
+// @version      5.5
+// @description  대화 프로필 자동 적용, 윤문·번역 지침, Firebase App Check, API 예상 비용
+// @match        https://crack.wrtn.ai/*
+// @grant        GM_addStyle
+// @grant        GM_setValue
+// @grant        GM_getValue
+// @grant        GM_xmlhttpRequest
+// @connect      generativelanguage.googleapis.com
+// @connect      crack-api.wrtn.ai
+// @connect      api.frankfurter.dev
+// @connect      firebaseappcheck.googleapis.com
+// ==/UserScript==
+
+(function() {
+    'use strict';
+
+    // ===================================================================================
+    // [상태 관리]
+    // ===================================================================================
+    const DEFAULT_FORMAT = '{번역문} ({원문})';
+
+    let settings = JSON.parse(GM_getValue('AITrans_settings', 
+        '{"provider":"google","apiKey":"","firebaseConfig":"","model":"gemini-3.8-flash","lang":"English","customLang":"","format":"' + DEFAULT_FORMAT.replace(/"/g, '\\"') + '","useContext":true,"usePolish":false,"maxLength":1000,"useTranslation":true,"creativity":"medium","thinkingLevel":"medium","contextLimit":6}'
+    ));
+    
+    if (settings.firebaseAppCheckToken === undefined) settings.firebaseAppCheckToken = '';
+    if (settings.format === undefined) settings.format = DEFAULT_FORMAT;
+    if (settings.customLang === undefined) settings.customLang = '';
+    if (settings.useContext === undefined) settings.useContext = true;
+    if (settings.usePolish === undefined) settings.usePolish = false;
+    if (settings.maxLength === undefined) settings.maxLength = 1000;
+    if (settings.useTranslation === undefined) settings.useTranslation = true;
+    // V4.x의 reasoning 값은 실제 추론이 아니라 temperature 단계였으므로 표현 강도로 이전한다.
+    if (settings.creativity === undefined) settings.creativity = settings.reasoning || 'medium';
+    if (settings.thinkingLevel === undefined) settings.thinkingLevel = 'medium';
+    if (settings.contextLimit === undefined) settings.contextLimit = 6;
+
+    function saveSettings() { GM_setValue('AITrans_settings', JSON.stringify(settings)); }
+
+    // 어시스턴트 3.40.0과 같은 방-대화 프로필 연결 규칙을 사용한다.
+    // 예전 AITrans_chars 데이터는 지우지 않지만 새 요청에는 사용하지 않는다.
+    const profileBase = 'https://crack-api.wrtn.ai';
+    const getCurrentChatId = () => location.pathname.match(/(?:episodes|chats?)\/([a-zA-Z0-9]{8,})/)?.[1] || null;
+    let activeProfile = { chatId: null, status: 'idle', name: '', information: '', checkedAt: 0 };
+    let profileLoad = null;
+    function showProfile() {
+        const el = document.getElementById('ait-profile-status');
+        if (!el) return;
+        el.textContent = activeProfile.status === 'ready'
+            ? `${activeProfile.name || '이름 없음'} · 현재 방에 자동 적용`
+            : activeProfile.status === 'loading' ? '현재 방 대화 프로필을 확인하는 중…'
+            : activeProfile.status === 'missing' ? '현재 방에 연결된 대화 프로필이 없어요'
+            : activeProfile.status === 'error' ? '대화 프로필을 읽지 못했어요 · 다시 열거나 번역을 눌러 재시도'
+            : '채팅방에 들어가면 대화 프로필을 자동으로 읽어요';
+        el.dataset.status = activeProfile.status;
+        el.title = activeProfile.status === 'ready' ? activeProfile.information : '';
+    }
+    function requestJson(url) {
+        const direct = async () => {
+            const controller = new AbortController();
+            const timeout = setTimeout(() => controller.abort(), 5000);
+            try {
+                const token = document.cookie.split(';').map(s => s.trim()).find(s => s.startsWith('access_token='))?.slice(13);
+                const response = await fetch(url, { credentials: 'include', signal: controller.signal,
+                    headers: token ? { Authorization: `Bearer ${token}` } : {} });
+                if (!response.ok) throw new Error(`HTTP ${response.status}`);
+                return await response.json();
+            } finally { clearTimeout(timeout); }
+        };
+        // 어시스턴트가 설치되어 있으면 이미 수집한 인증 헤더로 가져오는 경로도 이용한다.
+        if (!document.getElementById('cwa-host')) return direct();
+        const assistant = new Promise((resolve, reject) => {
+            const done = (error, value) => { clearTimeout(timer); window.removeEventListener('cwa-capture', receive);
+                error ? reject(error) : resolve(value); };
+            const receive = (event) => {
+                const data = event.detail;
+                if (!data || String(data.url).split('?')[0] !== url) return;
+                try {
+                    if (data.status < 200 || data.status >= 300) throw new Error(`HTTP ${data.status}`);
+                    done(null, JSON.parse(data.body));
+                } catch (error) { done(error); }
+            };
+            const timer = setTimeout(() => done(new Error('대화 프로필 응답 시간 초과')), 5500);
+            window.addEventListener('cwa-capture', receive);
+            window.dispatchEvent(new CustomEvent('cwa-fetch', { detail: url }));
+        });
+        return Promise.any([direct(), assistant]);
+    }
+    async function syncCurrentProfile(force = false) {
+        const chatId = getCurrentChatId();
+        if (!chatId) {
+            activeProfile = { chatId: null, status: 'idle', name: '', information: '', checkedAt: 0 };
+            showProfile();
+            return activeProfile;
+        }
+        if (profileLoad?.chatId === chatId) return profileLoad.promise;
+        if (!force && activeProfile.chatId === chatId && activeProfile.status === 'ready' && Date.now() - activeProfile.checkedAt < 30000)
+            return activeProfile;
+        activeProfile = { chatId, status: 'loading', name: '', information: '', checkedAt: 0 };
+        showProfile();
+        const promise = (async () => {
+            try {
+                const [roomJson, accountJson] = await Promise.all([
+                    requestJson(`${profileBase}/crack-gen/v3/chats/${chatId}`),
+                    requestJson(`${profileBase}/crack-api/profiles`)
+                ]);
+                const room = roomJson?.data;
+                const accountId = accountJson?.data?._id;
+                const wantedId = room?.chatProfile?._id;
+                if (!room || !accountId) throw new Error('방 또는 계정 정보가 없음');
+                const profilesJson = await requestJson(`${profileBase}/crack-api/profiles/${encodeURIComponent(accountId)}/chat-profiles`);
+                const list = profilesJson?.data?.chatProfiles;
+                if (!Array.isArray(list)) throw new Error('대화 프로필 목록이 없음');
+                const selected = wantedId ? list.find(p => p?._id === wantedId)
+                    : list.find(p => p?.isRepresentative) || list[0];
+                if (getCurrentChatId() !== chatId) return activeProfile;
+                activeProfile = selected && (selected.name || selected.information)
+                    ? { chatId, status: 'ready', name: String(selected.name || '').trim(),
+                        information: String(selected.information || '').trim(), checkedAt: Date.now() }
+                    : { chatId, status: 'missing', name: '', information: '', checkedAt: Date.now() };
+            } catch (error) {
+                if (getCurrentChatId() !== chatId) return activeProfile;
+                activeProfile = { chatId, status: 'error', name: '', information: '', checkedAt: Date.now() };
+            }
+            showProfile();
+            return activeProfile;
+        })();
+        profileLoad = { chatId, promise };
+        try { return await promise; }
+        finally { if (profileLoad?.promise === promise) profileLoad = null; }
+    }
+
+    // 이 브라우저의 Tampermonkey 저장소에 토큰·예상 비용만 저장한다 (원문/응답/키는 저장하지 않음).
+    const USAGE_KEY = 'AITrans_usage_v1';
+    const PANEL_SIZE_KEY = 'AITrans_panelSize_v1';
+    const FX_KEY = 'AITrans_fx_USDKRW_v1';
+    const emptyUsage = () => ({ count: 0, input: 0, output: 0, thinking: 0, total: 0, cached: 0,
+        pricedCount: 0, usd: 0, krwCount: 0, krw: 0, last: null });
+    let usage = emptyUsage();
+    try {
+        const saved = GM_getValue(USAGE_KEY, '{}');
+        const parsed = typeof saved === 'string' ? JSON.parse(saved) : saved;
+        if (parsed && typeof parsed === 'object' && !Array.isArray(parsed)) usage = { ...emptyUsage(), ...parsed };
+    } catch (e) { usage = emptyUsage(); }
+
+    let exchangeRate = null;
+    let fxAttempted = false;
+    try {
+        const saved = GM_getValue(FX_KEY, '{}');
+        const parsed = typeof saved === 'string' ? JSON.parse(saved) : saved;
+        if (Number.isFinite(parsed.rate) && parsed.rate > 0 && /^\d{4}-\d{2}-\d{2}$/.test(parsed.date)) exchangeRate = parsed;
+    } catch (e) { /* 환율은 연결되면 다시 가져온다 */ }
+    let fxRequest = null;
+    const koreaDay = () => new Intl.DateTimeFormat('en-CA', { timeZone: 'Asia/Seoul', year: 'numeric', month: '2-digit', day: '2-digit' })
+        .format(new Date());
+
+    function refreshExchangeRate() {
+        if (exchangeRate?.checkedDay === koreaDay()) return Promise.resolve(exchangeRate);
+        if (fxRequest) return fxRequest;
+        fxAttempted = true;
+        fxRequest = new Promise(resolve => {
+            GM_xmlhttpRequest({
+                method: 'GET', url: 'https://api.frankfurter.dev/v2/rate/usd/krw', timeout: 6000,
+                onload: response => {
+                    try {
+                        const data = JSON.parse(response.responseText);
+                        if (response.status >= 200 && response.status < 300 && Number.isFinite(data.rate) && data.rate > 0 && /^\d{4}-\d{2}-\d{2}$/.test(data.date)) {
+                            exchangeRate = { rate: data.rate, date: data.date, checkedDay: koreaDay() };
+                            GM_setValue(FX_KEY, JSON.stringify(exchangeRate));
+                        }
+                    } catch (e) { /* 환율 조회 실패 시 마지막 환율 사용 */ }
+                    renderUsage(); resolve(exchangeRate);
+                },
+                onerror: () => resolve(exchangeRate), ontimeout: () => resolve(exchangeRate)
+            });
+        }).catch(() => exchangeRate).finally(() => { fxRequest = null; renderUsage(); });
+        return fxRequest;
+    }
+
+    // Google Developer API 및 Firebase Vertex AI 글로벌 표준 유료 요금 (USD / 1M 토큰).
+    // 요금 변경 시 공식 표를 확인해 갱신한다. 미지원 모델은 임의 요금을 적용하지 않는다.
+    const PRICES = {
+        'gemini-3.8-flash': { input: .75, output: 3.75, cached: .075, after2026: true },
+        'gemini-3.7-flash': { input: .75, output: 3.75, cached: .075, after2026: true },
+        'gemini-3.5-flash': { input: 1.5, output: 9, cached: .15 },
+        'gemini-3.1-flash-lite-preview': { input: .25, output: 1.5, cached: .025 },
+        'gemini-3.1-pro-preview': { input: 2, output: 12, cached: .2, longInput: true }
+    };
+    function priceFor(model, input) {
+        const price = PRICES[model];
+        if (!price) return null;
+        if (price.after2026 && koreaDay() >= '2027-01-01') return { input: 1.5, output: 7.5, cached: .15 };
+        if (price.longInput && input > 200000) return { input: 4, output: 18, cached: .4 };
+        return price;
+    }
+
+    const tokenNumber = (value) => Number.isFinite(Number(value)) && Number(value) >= 0 ? Number(value) : 0;
+    const formatTokens = (value) => tokenNumber(value).toLocaleString('ko-KR');
+    const formatUsd = (value) => value > 0 && value < .000001 ? '<$0.000001'
+        : `$${Number(value).toLocaleString('en-US', { minimumFractionDigits: 4, maximumFractionDigits: 6 })}`;
+    const formatKrw = (value) => value > 0 && value < .005 ? '<₩0.01'
+        : `₩${Number(value).toLocaleString('ko-KR', { minimumFractionDigits: 0, maximumFractionDigits: 2 })}`;
+
+    function renderUsage() {
+        const last = usage.last;
+        const set = (id, value) => {
+            const el = document.getElementById(id);
+            if (el) el.textContent = value;
+        };
+        set('ait-last-total', last ? formatTokens(last.total) : '—');
+        set('ait-all-total', formatTokens(usage.total));
+        set('ait-last-breakdown', last
+            ? `입력 ${formatTokens(last.input)} · 출력 ${formatTokens(last.output)} · 추론 ${formatTokens(last.thinking)}`
+            : '아직 기록된 요청이 없어요');
+        set('ait-all-breakdown', `입력 ${formatTokens(usage.input)} · 출력 ${formatTokens(usage.output)} · 추론 ${formatTokens(usage.thinking)}`);
+        set('ait-last-cost', last && Number.isFinite(last.usd)
+            ? `${formatUsd(last.usd)} · ${Number.isFinite(last.krw) ? formatKrw(last.krw) : '원화 계산 불가'}` : '비용 기록 없음');
+        set('ait-all-cost', tokenNumber(usage.pricedCount)
+            ? `${formatUsd(usage.usd)} · ${tokenNumber(usage.krwCount) ? formatKrw(usage.krw) : '원화 계산 불가'}` : '비용 기록 없음');
+        set('ait-fx-note', exchangeRate
+            ? `USD/KRW ${formatKrw(exchangeRate.rate)} (1달러 · ${exchangeRate.date} 기준${exchangeRate.checkedDay === koreaDay() ? '' : ', 마지막 저장값'})`
+            : fxAttempted && !fxRequest ? '원화 환율 조회 실패 · 연결되면 다시 시도' : '원화 환율 조회 중 · 연결되지 않으면 달러만 표시');
+        set('ait-usage-note', last
+            ? `직전 ${last.model} · ${last.provider === 'firebase' ? 'Firebase' : 'Google API'} · 기록 ${formatTokens(usage.count)}회` +
+              (last.cached > 0 ? ` · 직전 캐시 ${formatTokens(last.cached)}` : '') +
+              (last.fxDate ? ` · 직전 원화 ${last.fxDate} 환율` : '') +
+              (tokenNumber(usage.pricedCount) < tokenNumber(usage.count) ? ` · 비용 기록 ${formatTokens(usage.pricedCount)}회` : '') +
+              (tokenNumber(usage.krwCount) < tokenNumber(usage.pricedCount) ? ` · 원화 기록 ${formatTokens(usage.krwCount)}회` : '')
+            : 'API 응답에 사용량이 포함된 요청부터 집계합니다');
+        const btn = document.getElementById('ai-trans-btn');
+        if (btn) btn.title = last ? `대화 프로필 번역/교정 · 직전 ${formatTokens(last.total)}토큰` : '대화 프로필 번역/교정';
+    }
+
+    function recordUsage(meta, provider, model) {
+        if (!meta || typeof meta !== 'object' ||
+            !['promptTokenCount', 'candidatesTokenCount', 'thoughtsTokenCount', 'totalTokenCount']
+                .some(key => Number.isFinite(Number(meta[key])))) return null;
+        const input = tokenNumber(meta.promptTokenCount);
+        const output = tokenNumber(meta.candidatesTokenCount);
+        const thinking = tokenNumber(meta.thoughtsTokenCount);
+        const total = meta.totalTokenCount == null ? input + output + thinking : tokenNumber(meta.totalTokenCount);
+        const cached = Math.min(input, tokenNumber(meta.cachedContentTokenCount));
+        const entry = { input, output, thinking, total, cached, provider, model, at: Date.now() };
+        const price = priceFor(model, input);
+        if (price) {
+            entry.usd = ((input - cached) * price.input + cached * price.cached +
+                (output + thinking) * price.output) / 1000000;
+            usage.usd = tokenNumber(usage.usd) + entry.usd;
+            usage.pricedCount = tokenNumber(usage.pricedCount) + 1;
+            if (exchangeRate?.rate) {
+                entry.fxRate = exchangeRate.rate;
+                entry.fxDate = exchangeRate.date;
+                entry.krw = entry.usd * entry.fxRate;
+                usage.krw = tokenNumber(usage.krw) + entry.krw;
+                usage.krwCount = tokenNumber(usage.krwCount) + 1;
+            }
+        }
+        for (const key of ['input', 'output', 'thinking', 'total', 'cached']) {
+            usage[key] = tokenNumber(usage[key]) + entry[key];
+        }
+        usage.count = tokenNumber(usage.count) + 1;
+        usage.last = entry;
+        try { GM_setValue(USAGE_KEY, JSON.stringify(usage)); } catch (e) { /* 화면 표시만 유지 */ }
+        renderUsage();
+        return entry;
+    }
+
+    // ===================================================================================
+    // [테마 감지]
+    // ===================================================================================
+    function isDarkTheme() {
+        const html = document.documentElement;
+        const body = document.body;
+        const hints = [
+            html.getAttribute('data-theme'), html.getAttribute('data-color-mode'), html.className,
+            body?.getAttribute('data-theme'), body?.getAttribute('data-color-mode'), body?.className
+        ].join(' ').toLowerCase();
+
+        if (/\bdark\b|theme-dark|dark-mode|darkmode|color-scheme-dark/.test(hints)) return true;
+        if (/\blight\b|theme-light|light-mode|lightmode|color-scheme-light/.test(hints)) return false;
+
+        try {
+            const probe = document.createElement('span');
+            probe.style.cssText = 'position:fixed;left:-9999px;color:var(--text_primary, var(--foreground, inherit));';
+            document.documentElement.appendChild(probe);
+            const rgb = getComputedStyle(probe).color.match(/\d+/g);
+            probe.remove();
+            if (rgb && rgb.length >= 3) {
+                const lum = (0.2126 * rgb[0] + 0.7152 * rgb[1] + 0.0722 * rgb[2]) / 255;
+                if (lum > 0.58) return true;
+                if (lum < 0.42) return false;
+            }
+        } catch (e) {}
+
+        return window.matchMedia?.('(prefers-color-scheme: dark)')?.matches || false;
+    }
+
+    function applyAitTheme() {
+        const theme = isDarkTheme() ? 'dark' : 'light';
+        document.getElementById('ai-trans-panel')?.setAttribute('data-ait-theme', theme);
+        document.getElementById('ai-trans-inline-group')?.setAttribute('data-ait-theme', theme);
+    }
+
+    function setReactValue(el, value) {
+        if (el.isContentEditable) {
+            el.innerText = value;
+            el.dispatchEvent(new Event("input", { bubbles: true }));
+            return;
+        }
+
+        const proto = el.tagName === "TEXTAREA" ? window.HTMLTextAreaElement.prototype : window.HTMLInputElement.prototype;
+        const setter = Object.getOwnPropertyDescriptor(proto, "value")?.set;
+        if (setter) setter.call(el, value);
+        else el.value = value;
+
+        el.dispatchEvent(new Event("input", { bubbles: true }));
+        el.dispatchEvent(new Event("change", { bubbles: true }));
+
+        if(el.tagName === "TEXTAREA") {
+            el.style.height = 'auto';
+            el.style.height = el.scrollHeight + 'px';
+        }
+    }
+
+    function toast(msg, type = "info") {
+        const palette = { success:"#73af85", warn:"#d3a766", error:"#d47a7a", info:"#aab2bd" };
+        const el = document.createElement("div");
+        el.textContent = msg;
+        el.style.cssText = `
+            position:fixed; bottom:80px; left:50%; transform:translateX(-50%);
+            z-index:999999; background:rgba(20,22,30,.94); color:#eceef6;
+            padding:10px 16px; border-radius:10px; font-size:12px; font-weight:bold;
+            border:1px solid rgba(205,216,255,.16); border-left:3px solid ${palette[type]||palette.info};
+            box-shadow:0 8px 24px rgba(0,0,0,.4); transition:opacity .4s; white-space:nowrap;
+            backdrop-filter:blur(10px); -webkit-backdrop-filter:blur(10px);
+        `;
+        document.body.appendChild(el);
+        setTimeout(() => { el.style.opacity="0"; setTimeout(()=>el.remove(),400); }, 3000);
+    }
+
+    // ===================================================================================
+    // [스타일 정의]
+    // ===================================================================================
+    GM_addStyle(`
+        #ai-trans-inline-group { display: flex; align-items: center; gap: 6px; margin-right: 8px; }
+        #ai-trans-inline-group > button {
+            width: 1.7rem; height: 1.7rem; min-width: 1.7rem; min-height: 1.7rem;
+            flex: 0 0 1.7rem; box-sizing: border-box; border-radius: 50%; padding: 0;
+            display: inline-flex; align-items: center; justify-content: center;
+            background: #fff; color: #343a40; border: 1px solid #e0e3e7;
+            box-shadow: none; cursor: pointer; line-height: 1;
+            transition: background .15s ease, border-color .15s ease;
+        }
+        #ai-trans-inline-group > button:hover { background: #f6f8fa; border-color: #c9cfd6; }
+        #ai-trans-inline-group > button:disabled { opacity: .55; cursor: wait; }
+        #ai-trans-inline-group > button:focus-visible { outline: 2px solid #637dd1; outline-offset: 2px; }
+        #ai-trans-inline-group svg { display: block; width: 15px; height: 15px; flex: none; }
+
+        #ai-trans-panel {
+            position: fixed; top: 8vh; left: 5vw; z-index: 999999; width: min(92vw, 410px); max-height: 82vh;
+            min-width: min(280px, calc(100vw - 16px));
+            border-radius: 13px; display: none; flex-direction: column; overflow: hidden;
+            font-family: Pretendard, system-ui, -apple-system, sans-serif;
+            background: #22252a; border: 1px solid #41454b; color: #f1f2f3;
+            box-shadow: 0 14px 38px rgba(0,0,0,.28);
+        }
+        #ai-trans-panel[data-ait-theme="light"] {
+            background: #fff; border: 1px solid #e1e3e6; color: #292c31; box-shadow: 0 12px 32px rgba(20,25,35,.14);
+        }
+
+        .ai-panel-header {
+            padding: 7px 12px; min-height: 25px; display: flex; justify-content: space-between; align-items: center; cursor: move;
+            font-weight: 800; font-size: 13px; user-select: none;
+            background: #292d32; border-bottom: 1px solid #3b3f46; color: inherit;
+        }
+        #ai-trans-panel[data-ait-theme="light"] .ai-panel-header { background: #f8f9fa; border-bottom-color: #e6e8eb; }
+        .ai-panel-close { cursor: pointer; color: inherit; opacity: .7; padding: 2px 6px; border-radius: 6px; font-weight: 400; font-size: 15px; }
+        .ai-panel-close:hover { opacity: 1; background: rgba(128,128,128,.12); }
+
+        .ai-content { padding: 12px 12px 26px; display: none; overflow-y: auto; min-height: 0; flex: 1 1 auto; overscroll-behavior: contain; }
+        .ai-content::-webkit-scrollbar { width: 4px; }
+        .ai-content::-webkit-scrollbar-thumb { background: rgba(255,255,255,.18); border-radius: 4px; }
+        #ai-trans-panel[data-ait-theme="light"] .ai-content::-webkit-scrollbar-thumb { background: #ccc; }
+        .ai-content.active { display: block; }
+
+        .ai-form-group { margin-bottom: 10px; }
+        .ai-form-group label { display: block; font-size: 11px; margin-bottom: 5px; font-weight: 700; color: #c4c8ce; }
+        .ai-form-group label.toggle-label { display: flex; align-items: center; gap: 8px; cursor: pointer; color: inherit; }
+        #ai-trans-panel[data-ait-theme="light"] .ai-form-group label { color: #4f535b; }
+
+        .ai-input {
+            width: 100%; padding: 7px 9px; box-sizing: border-box; font-size: 12px; outline: none;
+            border-radius: 7px; background: #2d3137; color: #f1f2f3;
+            border: 1px solid #474b52; transition: border-color .15s ease;
+        }
+        .ai-input:focus { border-color: #a0a5ae; }
+        .ai-input::placeholder { color: #8f959d; }
+        select.ai-input option { color: #111; background: #fff; }
+        #ai-trans-panel[data-ait-theme="light"] .ai-input { background: #fff; color: #292c31; border: 1px solid #d9dce1; }
+        #ai-trans-panel[data-ait-theme="light"] .ai-input:focus { border-color: #747b85; }
+        #ai-trans-panel .ai-input:focus-visible, #ai-trans-panel button:focus-visible, #ai-trans-panel summary:focus-visible {
+            outline: 2px solid #8292a8; outline-offset: 2px;
+        }
+        textarea.ai-input { resize: vertical; min-height: 50px; }
+        #cfg-firebase { min-height: 70px; font-family: ui-monospace, monospace; font-size: 11px; white-space: pre-wrap; }
+        #cfg-format { min-height: 40px; font-family: ui-monospace, monospace; font-size: 12px; }
+
+        .ai-btn-full {
+            width: 100%; border: 1px solid #d9dce0; padding: 9px; border-radius: 8px;
+            cursor: pointer; font-weight: 800; margin-top: 6px; font-size: 12px;
+            background: #eceef0; color: #272b30; transition: background .15s ease;
+        }
+        .ai-btn-full:hover { background: #dfe2e5; }
+        .ai-btn-full:active { transform: translateY(1px); }
+        #ai-trans-panel[data-ait-theme="light"] .ai-btn-full { background: #31363c; color: #fff; border-color: #31363c; }
+        #ai-trans-panel[data-ait-theme="light"] .ai-btn-full:hover { background: #454b53; }
+
+        .ait-section-title { margin: 1px 0 10px; font-size: 11px; letter-spacing: .02em; font-weight: 800; opacity: .75; }
+        .ait-profile-status { padding: 8px 10px; border: 1px solid #454a51; border-radius: 8px;
+            background: #2c3036; color: #e8eaec; font-size: 11px; line-height: 1.4; overflow-wrap: anywhere; }
+        .ait-profile-status[data-status="error"], .ait-profile-status[data-status="missing"] { color: #dcc5ab; }
+        #ai-trans-panel[data-ait-theme="light"] .ait-profile-status { background: #f8f9fa; border-color: #e2e5e8; color: #343941; }
+        #ai-trans-panel[data-ait-theme="light"] .ait-profile-status[data-status="error"],
+        #ai-trans-panel[data-ait-theme="light"] .ait-profile-status[data-status="missing"] { color: #8f6041; }
+        .ait-grid { display: grid; grid-template-columns: minmax(0, 1fr) minmax(0, 1fr); gap: 0 9px; }
+        .ait-switches { display: grid; gap: 8px; padding: 10px 11px; margin: 4px 0 12px; border-radius: 8px; background: #2a2e34; border: 1px solid #40454b; }
+        .ait-switches .toggle-label { line-height: 1.4; }
+        .ait-switches input[type="checkbox"] { accent-color: #6e7782; margin: 0; }
+        .ait-usage { margin-top: 11px; padding: 11px 12px; border: 1px solid #40454b; border-radius: 9px; background: #292d32; }
+        .ait-usage-title { font-size: 11px; font-weight: 800; opacity: .82; margin-bottom: 8px; }
+        .ait-usage-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 8px; }
+        .ait-usage-cell { padding: 8px; border-radius: 7px; background: #33383e; min-width: 0; }
+        .ait-usage-label { display: block; font-size: 10px; opacity: .68; }
+        .ait-usage-value { display: block; font-size: 19px; line-height: 1.25; font-weight: 800; font-variant-numeric: tabular-nums; margin: 2px 0 4px; }
+        .ait-usage-detail { display: block; font-size: 10px; line-height: 1.5; opacity: .8; overflow-wrap: anywhere; }
+        .ait-usage-cost { display: block; margin-top: 7px; padding-top: 7px; border-top: 1px solid #51565c;
+            color: #e1e4e8; font-size: 11px; font-weight: 700; font-variant-numeric: tabular-nums; overflow-wrap: anywhere; }
+        .ait-fx-note { margin-top: 8px; font-size: 10px; opacity: .85; }
+        .ait-usage-note { font-size: 10px; opacity: .66; margin-top: 7px; line-height: 1.5; }
+        .ait-api { margin-top: 12px; border: 1px solid #454a51; border-radius: 9px; overflow: hidden; }
+        .ait-api summary { list-style: none; cursor: pointer; padding: 11px 12px; font-size: 12px; font-weight: 800; display: flex; align-items: center; justify-content: space-between; user-select: none; }
+        .ait-api summary::-webkit-details-marker { display: none; }
+        .ait-api summary::after { content: '⌄'; font-size: 15px; opacity: .75; transition: transform .15s ease; }
+        .ait-api[open] summary::after { transform: rotate(180deg); }
+        .ait-api-body { padding: 0 12px 12px; }
+        .ait-api-hint { font-size: 10px; line-height: 1.5; opacity: .65; margin: 0 0 10px; }
+        #ai-trans-panel[data-ait-theme="light"] .ait-switches, #ai-trans-panel[data-ait-theme="light"] .ait-usage { background: #f8f9fa; border-color: #e3e6e9; }
+        #ai-trans-panel[data-ait-theme="light"] .ait-usage-cell { background: #fff; }
+        #ai-trans-panel[data-ait-theme="light"] .ait-usage-cost { color: #343941; border-top-color: #e5e8eb; }
+        #ai-trans-panel[data-ait-theme="light"] .ait-api { border-color: #e1e4e8; }
+        #ai-trans-panel[data-ait-theme="light"] .ai-panel-close:hover { background: #e9ecef; }
+        .ait-resize-handle {
+            position: absolute; right: 2px; bottom: 2px; z-index: 2;
+            width: 34px; height: 34px; border: 0; border-radius: 9px;
+            background: rgba(255,255,255,.04); color: inherit; opacity: .65;
+            font-size: 19px; line-height: 1; cursor: nwse-resize;
+            touch-action: none; user-select: none; -webkit-user-select: none;
+        }
+        .ait-resize-handle:hover, .ait-resize-handle:active { opacity: 1; background: rgba(255,255,255,.12); }
+        #ai-trans-panel[data-ait-theme="light"] .ait-resize-handle { background: #f2f4f6; }
+        #ai-trans-panel[data-ait-theme="light"] .ait-resize-handle:hover,
+        #ai-trans-panel[data-ait-theme="light"] .ait-resize-handle:active { background: #e6e9ed; }
+
+        @keyframes spin { 100% { transform: rotate(360deg); } }
+        .spin-icon { display: inline-block; animation: spin 1s linear infinite; }
+    `);
+
+    // ===================================================================================
+    // [설정 값 파싱]
+    // ===================================================================================
+    const LANGUAGES = [
+        { value: 'English', label: '영어' },
+        { value: 'Japanese', label: '일본어' },
+        { value: 'Chinese (Simplified)', label: '중국어 간체' },
+        { value: 'Chinese (Traditional)', label: '중국어 번체' },
+        { value: 'Russian', label: '러시아어' },
+        { value: '__custom__', label: '직접 입력…' }
+    ];
+
+    function getTargetLang() {
+        if (settings.lang === '__custom__') return (settings.customLang || '').trim() || 'English';
+        return settings.lang || 'English';
+    }
+
+    function buildFormatInstruction() {
+        let fmt = (settings.format || '').trim();
+        if (!fmt.includes('{번역문}')) fmt = DEFAULT_FORMAT;
+        const pattern = fmt.split('{번역문}').join('<TRANSLATED_DIALOGUE>').split('{원문}').join('<ORIGINAL_KOREAN_DIALOGUE>');
+        return { pattern, includesOriginal: fmt.includes('{원문}') };
+    }
+
+    // ===================================================================================
+    // [UI 패널 생성]
+    // ===================================================================================
+    const UI = {
+        init() {
+            this.createPanel();
+            this.bindEvents();
+            showProfile();
+            renderUsage();
+            refreshExchangeRate();
+            applyAitTheme();
+        },
+
+        createPanel() {
+            const panel = document.createElement('div');
+            panel.id = 'ai-trans-panel';
+            const langOptions = LANGUAGES.map(l => `<option value="${l.value}">${l.label}</option>`).join('');
+
+            panel.innerHTML = `
+                <div class="ai-panel-header" id="ai-panel-drag">
+                    <span>대화 프로필 맞춤 번역기 <small style="opacity:.55;font-weight:500;">v5.5</small></span>
+                    <button type="button" class="ai-panel-close" id="ai-panel-close" aria-label="설정 닫기" style="border:0;background:transparent;color:inherit;">✕</button>
+                </div>
+                <div class="ai-content active" id="tab-main">
+                    <div class="ait-section-title">문장 설정</div>
+                    <div class="ai-form-group">
+                        <label>현재 방 대화 프로필</label>
+                        <div id="ait-profile-status" class="ait-profile-status" role="status">대화 프로필 확인 중…</div>
+                    </div>
+
+                    <div class="ait-grid">
+                        <div class="ai-form-group" id="group-lang">
+                            <label>목표 언어</label>
+                            <select id="cfg-lang" class="ai-input">${langOptions}</select>
+                        </div>
+                        <div class="ai-form-group">
+                            <label title="추가할 표정·행동·감각 묘사의 범위를 조절합니다.">창작 강도</label>
+                            <select id="cfg-creativity" class="ai-input">
+                                <option value="low">낮음 (원문 충실)</option>
+                                <option value="medium">보통 (균형 윤문)</option>
+                                <option value="high">높음 (풍부한 확장)</option>
+                            </select>
+                        </div>
+                        <div class="ai-form-group">
+                            <label title="thinkingLevel: 응답 전 맥락·감정 근거·말투 일관성을 검토하는 깊이입니다.">추론 수준</label>
+                            <select id="cfg-thinking" class="ai-input">
+                                <option value="low">낮음 (빠름)</option>
+                                <option value="medium">보통 (권장)</option>
+                                <option value="high">높음 (정밀/느림)</option>
+                            </select>
+                        </div>
+                    </div>
+
+                    <div class="ai-form-group" id="group-custom-lang" style="display:none;">
+                        <label>목표 언어 직접 입력</label>
+                        <input type="text" id="cfg-custom-lang" class="ai-input" placeholder="예: Polish, Swahili...">
+                    </div>
+
+                    <div class="ait-switches ai-form-group">
+                        <label class="toggle-label" title="끄면 번역 없이 한국어 문장과 말투만 다듬습니다.">
+                            <input type="checkbox" id="cfg-translate"> 외국어 번역
+                        </label>
+                        <label class="toggle-label">
+                            <input type="checkbox" id="cfg-context"> 최근 대화 맥락 반영
+                        </label>
+                        <label class="toggle-label" title="감각적 묘사 지침(빛/온도/심리)을 적용하여 서술을 풍부하게 윤문합니다.">
+                            <input type="checkbox" id="cfg-polish"> 서술 윤문 · 감정/표정 생성
+                        </label>
+                    </div>
+
+                    <div class="ait-grid">
+                        <div class="ai-form-group" id="group-format" style="grid-column:1 / -1;">
+                            <label>출력 형식</label>
+                            <textarea id="cfg-format" class="ai-input" style="min-height:34px; height:38px;" placeholder="${DEFAULT_FORMAT}"></textarea>
+                        </div>
+                        <div class="ai-form-group" id="group-context-limit">
+                            <label title="AI가 읽을 최근 대화 수">맥락 수(턴)</label>
+                            <input type="number" id="cfg-context-limit" class="ai-input" value="6" min="1" max="50" step="1">
+                        </div>
+                        <div class="ai-form-group">
+                            <label title="이 글자 수를 넘지 않도록 제한합니다.">글자수 제한</label>
+                            <input type="number" id="cfg-max-length" class="ai-input" value="1000" min="100" max="5000" step="100">
+                        </div>
+                    </div>
+
+                    <div class="ait-usage" aria-live="polite">
+                        <div class="ait-usage-title">API 사용량 <span style="font-weight:500;opacity:.65;">· 토큰 / 예상 비용</span></div>
+                        <div class="ait-usage-grid">
+                            <div class="ait-usage-cell">
+                                <span class="ait-usage-label">직전 1회</span>
+                                <strong class="ait-usage-value" id="ait-last-total">—</strong>
+                                <span class="ait-usage-detail" id="ait-last-breakdown">아직 기록된 요청이 없어요</span>
+                                <span class="ait-usage-cost" id="ait-last-cost">비용 기록 없음</span>
+                            </div>
+                            <div class="ait-usage-cell">
+                                <span class="ait-usage-label">누적</span>
+                                <strong class="ait-usage-value" id="ait-all-total">0</strong>
+                                <span class="ait-usage-detail" id="ait-all-breakdown">입력 0 · 출력 0 · 추론 0</span>
+                                <span class="ait-usage-cost" id="ait-all-cost">비용 기록 없음</span>
+                            </div>
+                        </div>
+                        <div class="ait-fx-note" id="ait-fx-note">원화 환율 조회 중</div>
+                        <div class="ait-usage-note" id="ait-usage-note">API 응답에 사용량이 포함된 요청부터 집계합니다</div>
+                        <div class="ait-usage-note">유료 표준 요금 기준 추정 · 무료 할당량·할인·세금·캐시 보관료 제외 · 기존 사용량의 비용은 소급하지 않음</div>
+                    </div>
+
+                    <details class="ait-api" id="ait-api-settings">
+                        <summary>API 설정</summary>
+                        <div class="ait-api-body">
+                            <p class="ait-api-hint">제공자·모델·인증 정보를 한곳에서 관리해요.</p>
+                            <div class="ait-grid">
+                                <div class="ai-form-group">
+                                    <label>API 제공자</label>
+                                    <select id="cfg-provider" class="ai-input">
+                                        <option value="google">Google API</option>
+                                        <option value="firebase">Firebase Vertex AI</option>
+                                    </select>
+                                </div>
+                                <div class="ai-form-group">
+                                    <label>사용 모델</label>
+                                    <select id="cfg-model" class="ai-input">
+                                        <option value="gemini-3.8-flash">3.8 Flash</option>
+                                        <option value="gemini-3.7-flash">3.7 Flash</option>
+                                        <option value="gemini-3.5-flash">3.5 Flash</option>
+                                        <option value="gemini-3.1-flash-lite-preview">3.1 Flash-Lite</option>
+                                        <option value="gemini-3.1-pro-preview">3.1 Pro</option>
+                                    </select>
+                                </div>
+                            </div>
+                            <div class="ai-form-group" id="group-api-key">
+                                <label>Google API 키</label>
+                                <input type="password" id="cfg-key" class="ai-input" autocomplete="off" placeholder="Google API Key 입력">
+                            </div>
+                            <div class="ai-form-group" id="group-firebase" style="display:none;">
+                                <label>Firebase 설정</label>
+                                <textarea id="cfg-firebase" class="ai-input" placeholder="firebaseConfig = { ... }; 형식의 스크립트 입력"></textarea>
+                                <label for="cfg-appcheck" style="margin-top:10px;">App Check 토큰 <span style="font-weight:400;opacity:.65;">선택</span></label>
+                                <input type="password" id="cfg-appcheck" class="ai-input" autocomplete="off" spellcheck="false" placeholder="발급된 JWT 또는 등록한 디버그 토큰">
+                                <p class="ait-api-hint" style="margin:6px 0 0;">JWT는 만료 시 새 토큰을 넣어주세요. 디버그 토큰은 해당 Firebase 앱의 App Check 콘솔에 먼저 등록해야 합니다. 비워두면 App Check 없이 요청합니다.</p>
+                            </div>
+                        </div>
+                    </details>
+
+                    <button class="ai-btn-full" id="btn-save-cfg">변경사항 저장</button>
+                </div>
+
+                <button type="button" id="ait-resize-handle" class="ait-resize-handle" aria-label="설정창 크기 조절" title="마우스나 손가락으로 끌어 창 크기 조절">↘</button>
+            `;
+            document.body.appendChild(panel);
+
+            const clamp = (value, min, max) => Math.max(min, Math.min(value, max));
+            const minWidth = () => Math.min(280, Math.max(1, window.innerWidth - 16));
+            const minHeight = () => Math.min(300, Math.max(1, window.innerHeight - 16));
+            const fitPanelToViewport = () => {
+                if (panel.style.display !== 'flex') return;
+                const rect = panel.getBoundingClientRect();
+                const maxLeft = Math.max(0, window.innerWidth - minWidth() - 8);
+                const maxTop = Math.max(0, window.innerHeight - minHeight() - 8);
+                const left = clamp(rect.left, 0, maxLeft);
+                const top = clamp(rect.top, 0, maxTop);
+                panel.style.left = `${left}px`;
+                panel.style.top = `${top}px`;
+                panel.style.width = `${clamp(rect.width, minWidth(), Math.max(minWidth(), window.innerWidth - left - 8))}px`;
+                if (panel.style.height) {
+                    panel.style.height = `${clamp(rect.height, minHeight(), Math.max(minHeight(), window.innerHeight - top - 8))}px`;
+                }
+            };
+            panel.aitFitToViewport = fitPanelToViewport;
+
+            try {
+                const saved = GM_getValue(PANEL_SIZE_KEY, '');
+                const size = typeof saved === 'string' ? JSON.parse(saved) : saved;
+                if (size && Number.isFinite(size.width) && Number.isFinite(size.height)) {
+                    panel.style.width = `${clamp(size.width, minWidth(), Math.max(minWidth(), window.innerWidth - 16))}px`;
+                    panel.style.height = `${clamp(size.height, minHeight(), Math.max(minHeight(), window.innerHeight - 16))}px`;
+                    panel.style.maxHeight = 'none';
+                }
+            } catch (e) { /* 저장된 크기가 손상됐으면 기본 크기로 표시 */ }
+
+            window.addEventListener('resize', fitPanelToViewport);
+
+            const resizeHandle = document.getElementById('ait-resize-handle');
+            let resizeState = null;
+            resizeHandle.addEventListener('pointerdown', (e) => {
+                if (e.pointerType === 'mouse' && e.button !== 0) return;
+                e.preventDefault();
+                const rect = panel.getBoundingClientRect();
+                panel.style.width = `${rect.width}px`;
+                panel.style.height = `${rect.height}px`;
+                panel.style.maxHeight = 'none';
+                resizeState = { pointerId: e.pointerId, x: e.clientX, y: e.clientY, width: rect.width, height: rect.height };
+                resizeHandle.setPointerCapture(e.pointerId);
+            });
+            resizeHandle.addEventListener('pointermove', (e) => {
+                if (!resizeState || e.pointerId !== resizeState.pointerId) return;
+                e.preventDefault();
+                const rect = panel.getBoundingClientRect();
+                panel.style.width = `${clamp(resizeState.width + e.clientX - resizeState.x,
+                    minWidth(), Math.max(minWidth(), window.innerWidth - rect.left - 8))}px`;
+                panel.style.height = `${clamp(resizeState.height + e.clientY - resizeState.y,
+                    minHeight(), Math.max(minHeight(), window.innerHeight - rect.top - 8))}px`;
+            });
+            const finishResize = (e) => {
+                if (!resizeState || e.pointerId !== resizeState.pointerId) return;
+                resizeState = null;
+                const rect = panel.getBoundingClientRect();
+                try { GM_setValue(PANEL_SIZE_KEY, JSON.stringify({ width: Math.round(rect.width), height: Math.round(rect.height) })); }
+                catch (error) { /* 현재 창 크기는 유지 */ }
+            };
+            resizeHandle.addEventListener('pointerup', finishResize);
+            resizeHandle.addEventListener('pointercancel', finishResize);
+
+            const dragHandle = document.getElementById('ai-panel-drag');
+            let isDragging = false, startX, startY, initLeft, initTop, initWidth, initHeight;
+
+            const dragStart = (e) => {
+                if (e.target.id === 'ai-panel-close') return;
+                isDragging = true;
+                const evt = e.touches ? e.touches[0] : e;
+                startX = evt.clientX; startY = evt.clientY;
+                const rect = panel.getBoundingClientRect();
+                initLeft = rect.left; initTop = rect.top;
+                initWidth = rect.width; initHeight = rect.height;
+            };
+            const dragMove = (e) => {
+                if (!isDragging) return;
+                e.preventDefault();
+                const evt = e.touches ? e.touches[0] : e;
+                panel.style.left = clamp(initLeft + (evt.clientX - startX), 0,
+                    Math.max(0, window.innerWidth - initWidth - 8)) + 'px';
+                panel.style.top = clamp(initTop + (evt.clientY - startY), 0,
+                    Math.max(0, window.innerHeight - initHeight - 8)) + 'px';
+                panel.style.right = 'auto';
+            };
+            const dragEnd = () => isDragging = false;
+
+            dragHandle.addEventListener('mousedown', dragStart);
+            document.addEventListener('mousemove', dragMove, { passive: false });
+            document.addEventListener('mouseup', dragEnd);
+
+            dragHandle.addEventListener('touchstart', dragStart, { passive: true });
+            document.addEventListener('touchmove', dragMove, { passive: false });
+            document.addEventListener('touchend', dragEnd);
+        },
+
+        bindEvents() {
+            document.getElementById('ai-panel-close').onclick = () => document.getElementById('ai-trans-panel').style.display = 'none';
+
+            const selProvider = document.getElementById('cfg-provider');
+            const selLang = document.getElementById('cfg-lang');
+            const groupKey = document.getElementById('group-api-key');
+            const groupFb = document.getElementById('group-firebase');
+            const groupCustomLang = document.getElementById('group-custom-lang');
+            const chkTranslate = document.getElementById('cfg-translate');
+            const chkContext = document.getElementById('cfg-context');
+
+            selProvider.value = settings.provider || 'google';
+            document.getElementById('cfg-key').value = settings.apiKey || '';
+            document.getElementById('cfg-firebase').value = settings.firebaseConfig || '';
+            document.getElementById('cfg-appcheck').value = settings.firebaseAppCheckToken || '';
+            document.getElementById('cfg-model').value = settings.model || 'gemini-3.8-flash';
+            document.getElementById('cfg-format').value = settings.format || DEFAULT_FORMAT;
+            document.getElementById('cfg-custom-lang').value = settings.customLang || '';
+            chkContext.checked = settings.useContext; 
+            document.getElementById('cfg-polish').checked = settings.usePolish;
+            document.getElementById('cfg-max-length').value = settings.maxLength || 1000;
+            document.getElementById('cfg-creativity').value = settings.creativity || 'medium';
+            document.getElementById('cfg-thinking').value = settings.thinkingLevel || 'medium';
+            document.getElementById('cfg-context-limit').value = settings.contextLimit || 6;
+            chkTranslate.checked = settings.useTranslation;
+
+            if (settings.lang && ![...selLang.options].some(o => o.value === settings.lang)) {
+                const opt = document.createElement('option');
+                opt.value = settings.lang;
+                opt.textContent = settings.lang;
+                selLang.insertBefore(opt, selLang.lastElementChild);
+            }
+            selLang.value = settings.lang || 'English';
+
+            const toggleProviderUI = () => {
+                const isGoogle = selProvider.value === 'google';
+                groupKey.style.display = isGoogle ? 'block' : 'none';
+                groupFb.style.display = isGoogle ? 'none' : 'block';
+            };
+            selProvider.addEventListener('change', toggleProviderUI);
+            toggleProviderUI();
+
+            const toggleTranslationUI = () => {
+                const isTrans = chkTranslate.checked;
+                document.getElementById('group-lang').style.display = isTrans ? 'block' : 'none';
+                document.getElementById('group-format').style.display = isTrans ? 'block' : 'none';
+                
+                const isCustom = selLang.value === '__custom__';
+                groupCustomLang.style.display = (isTrans && isCustom) ? 'block' : 'none';
+            };
+            chkTranslate.addEventListener('change', toggleTranslationUI);
+            selLang.addEventListener('change', toggleTranslationUI);
+            toggleTranslationUI();
+
+            const toggleContextUI = () => {
+                const isCtx = chkContext.checked;
+                document.getElementById('group-context-limit').style.opacity = isCtx ? '1' : '0.4';
+                document.getElementById('cfg-context-limit').disabled = !isCtx;
+            };
+            chkContext.addEventListener('change', toggleContextUI);
+            toggleContextUI();
+
+            document.getElementById('btn-save-cfg').onclick = () => {
+                const fmt = document.getElementById('cfg-format').value.trim();
+                const isTrans = chkTranslate.checked;
+                if (isTrans && fmt && !fmt.includes('{번역문}')) return toast('출력 형식에 {번역문}이 반드시 포함돼야 해요', 'warn');
+                if (isTrans && selLang.value === '__custom__' && !document.getElementById('cfg-custom-lang').value.trim()) {
+                    return toast('직접 입력할 언어를 적어주세요', 'warn');
+                }
+
+                settings.provider = selProvider.value;
+                settings.apiKey = document.getElementById('cfg-key').value;
+                settings.firebaseConfig = document.getElementById('cfg-firebase').value;
+                settings.firebaseAppCheckToken = document.getElementById('cfg-appcheck').value.trim().replace(/^Bearer\s+/i, '');
+                appCheckCache = null;
+                settings.model = document.getElementById('cfg-model').value;
+                settings.lang = selLang.value;
+                settings.customLang = document.getElementById('cfg-custom-lang').value.trim();
+                settings.format = fmt || DEFAULT_FORMAT;
+                settings.useContext = chkContext.checked; 
+                settings.usePolish = document.getElementById('cfg-polish').checked;
+                settings.useTranslation = isTrans;
+                settings.maxLength = parseInt(document.getElementById('cfg-max-length').value, 10) || 1000;
+                settings.creativity = document.getElementById('cfg-creativity').value;
+                settings.thinkingLevel = document.getElementById('cfg-thinking').value;
+                settings.contextLimit = parseInt(document.getElementById('cfg-context-limit').value, 10) || 6;
+
+                saveSettings();
+                toast('설정 저장됨', 'success');
+            };
+        }
+    };
+
+    // ===================================================================================
+    // [번역 엔진 & API 호출]
+    // ===================================================================================
+    function getChatInput() {
+        return document.querySelector('.__chat_input_textarea') ||
+               document.querySelector('div[contenteditable="true"]') ||
+               document.querySelector('textarea');
+    }
+
+    async function getRecentContext(limitCount) {
+        const path = location.pathname.match(/\/stories\/([^/]+)\/episodes\/([^/]+)/);
+        if (!path) {
+            const bubbles = Array.from(document.querySelectorAll('div[dir="auto"], .whitespace-pre-wrap, p')).slice(-(limitCount * 2));
+            return bubbles.map(b => b.textContent.trim()).filter(Boolean).join('\n\n');
+        }
+        try {
+            const token = document.cookie.split(";").map((c) => c.trim()).find((c) => c.startsWith("access_token="))?.slice(13);
+            if (!token) return "";
+            const res = await fetch(`https://crack-api.wrtn.ai/crack-gen/v3/chats/${path[2]}/messages?limit=${limitCount}`, {
+                headers: { Authorization: `Bearer ${token}`, "Content-Type": "application/json" }
+            });
+            const json = await res.json();
+            const msgs = (json.data ?? json).messages ?? [];
+            return msgs.reverse().map(m => `[${m.role === "assistant" ? "상대방" : "나"}]: ${m.content}`).join("\n\n");
+        } catch(e) { return ""; }
+    }
+
+    function parseVertexContent(scriptStr) {
+        try {
+            const match = scriptStr.match(/firebaseConfig\s*=\s*(\{[\s\S]*?\});/);
+            if (match && match[1]) return new Function("return " + match[1])();
+            if (scriptStr.includes("apiKey")) {
+                const startText = "firebaseConfig = {";
+                const startIndex = scriptStr.indexOf(startText);
+                if (startIndex !== -1) {
+                    const endIndex = scriptStr.indexOf("}", startIndex);
+                    if (endIndex !== -1) {
+                        const objStr = scriptStr.substring(startIndex + startText.length - 1, endIndex + 1);
+                        return new Function("return " + objStr)();
+                    }
+                }
+            }
+        } catch(e) {}
+        return null;
+    }
+
+    const TRANSLATE_ICON = '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><circle cx="12" cy="12" r="9"/><path d="M3 12h18M12 3c2.4 2.5 3.5 5.5 3.5 9s-1.1 6.5-3.5 9M12 3c-2.4 2.5-3.5 5.5-3.5 9s1.1 6.5 3.5 9"/></svg>';
+    const SETTINGS_ICON = '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M4 6h16M4 12h16M4 18h16"/><circle cx="9" cy="6" r="2" fill="white"/><circle cx="15" cy="12" r="2" fill="white"/><circle cx="9" cy="18" r="2" fill="white"/></svg>';
+    const LOADING_ICON = '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" aria-hidden="true"><path d="M20 12a8 8 0 1 1-8-8"/></svg>';
+
+    // 입력 토큰은 GM 설정에만 저장한다. 교환된 JWT는 메모리에만 보관한다.
+    let appCheckCache = null;
+    function readAppCheckJwt(token) {
+        const parts = token.split('.');
+        if (parts.length !== 3 || parts.some(part => !/^[A-Za-z0-9_-]+$/.test(part))) {
+            throw new Error('App Check JWT 형식을 확인해 주세요.');
+        }
+        let payload;
+        try {
+            const encoded = parts[1].replace(/-/g, '+').replace(/_/g, '/');
+            payload = JSON.parse(atob(encoded.padEnd(Math.ceil(encoded.length / 4) * 4, '=')));
+        } catch (_) { throw new Error('App Check JWT 형식을 확인해 주세요.'); }
+        const expireTimeMillis = typeof payload.exp === 'number' ? payload.exp * 1000 : NaN;
+        if (!Number.isFinite(expireTimeMillis)) throw new Error('만료 시간이 없는 App Check JWT입니다.');
+        if (expireTimeMillis <= Date.now() + 30000) {
+            throw new Error('App Check JWT가 만료됐거나 곧 만료됩니다. 새 토큰을 넣고 저장해 주세요.');
+        }
+        // 서명·앱 일치 여부는 Firebase 서버가 검증한다.
+        return { token, expireTimeMillis };
+    }
+
+    async function getConfiguredAppCheckToken(config, input) {
+        const secret = input.trim().replace(/^Bearer\s+/i, '');
+        if (secret.includes('.')) return readAppCheckJwt(secret);
+        if (!secret || /\s/.test(secret)) throw new Error('App Check 디버그 토큰 형식을 확인해 주세요.');
+        if (!config.projectId || !config.appId || !config.apiKey) {
+            throw new Error('디버그 토큰을 쓰려면 Firebase 설정에 projectId, appId, apiKey가 필요합니다.');
+        }
+        const cacheKey = JSON.stringify([config.projectId, config.appId, config.apiKey, secret]);
+        if (appCheckCache?.key === cacheKey && appCheckCache.value.expireTimeMillis > Date.now() + 60000) {
+            return appCheckCache.value;
+        }
+        const value = await new Promise((resolve, reject) => {
+            GM_xmlhttpRequest({
+                method: 'POST',
+                url: `https://firebaseappcheck.googleapis.com/v1/projects/${encodeURIComponent(config.projectId)}/apps/${encodeURIComponent(config.appId)}:exchangeDebugToken?key=${encodeURIComponent(config.apiKey)}`,
+                headers: { 'Content-Type': 'application/json' },
+                data: JSON.stringify({ debugToken: secret }),
+                timeout: 15000,
+                onload: (res) => {
+                    if (res.status < 200 || res.status >= 300) {
+                        return reject(new Error(`App Check 토큰 교환 실패 (${res.status}). Firebase 설정과 해당 앱의 디버그 토큰 등록을 확인해 주세요.`));
+                    }
+                    try {
+                        const data = JSON.parse(res.responseText);
+                        const jwt = readAppCheckJwt(data.token || '');
+                        const ttlSeconds = /^\d+(?:\.\d+)?s$/.test(data.ttl || '') ? parseFloat(data.ttl) : NaN;
+                        if (Number.isFinite(ttlSeconds)) {
+                            jwt.expireTimeMillis = Math.min(jwt.expireTimeMillis, Date.now() + ttlSeconds * 1000);
+                        }
+                        if (jwt.expireTimeMillis <= Date.now() + 30000) throw new Error('short TTL');
+                        resolve(jwt);
+                    } catch (_) { reject(new Error('App Check 토큰 응답이 올바르지 않습니다.')); }
+                },
+                onerror: () => reject(new Error('App Check 토큰 교환 중 네트워크 오류가 발생했습니다.')),
+                ontimeout: () => reject(new Error('App Check 토큰 교환 시간이 초과됐습니다.'))
+            });
+        });
+        appCheckCache = { key: cacheKey, value };
+        return value;
+    }
+
+    async function configureFirebaseAppCheck(app, config) {
+        const input = (settings.firebaseAppCheckToken || '').trim();
+        if (!input) return;
+        const { initializeAppCheck, CustomProvider, getToken } = await import('https://www.gstatic.com/firebasejs/12.8.0/firebase-app-check.js');
+        const appCheck = initializeAppCheck(app, {
+            provider: new CustomProvider({ getToken: () => getConfiguredAppCheckToken(config, input) }),
+            isTokenAutoRefreshEnabled: false
+        });
+        // 사전 확인 후 AI SDK가 X-Firebase-AppCheck 헤더에 토큰을 전달한다.
+        // 수동 JWT는 자동 재발급할 수 없으므로 만료 시 입력을 갱신해야 한다.
+        await getToken(appCheck, true);
+    }
+
+    async function executeTranslation() {
+        const inputEl = getChatInput();
+        if (!inputEl) return toast('입력창을 찾을 수 없음', 'error');
+
+        const isEditableDiv = inputEl.isContentEditable;
+        const rawText = isEditableDiv ? inputEl.innerText : inputEl.value;
+
+        if (!rawText || !rawText.trim()) return toast('변환할 텍스트를 입력하세요', 'warn');
+        if ((settings.provider === 'google' && !settings.apiKey) || (settings.provider === 'firebase' && !settings.firebaseConfig)) {
+            const panel = document.getElementById('ai-trans-panel');
+            panel.style.display = 'flex';
+            document.getElementById('ait-api-settings').open = true;
+            panel.aitFitToViewport?.();
+            applyAitTheme();
+            return toast(settings.provider === 'firebase' ? 'Firebase 설정을 입력하고 저장해 주세요' : 'Google API 키를 입력하고 저장해 주세요', 'warn');
+        }
+        const conversationProfile = await syncCurrentProfile(true);
+        if (conversationProfile.status !== 'ready' || conversationProfile.chatId !== getCurrentChatId()) {
+            return toast('현재 방 대화 프로필을 읽지 못했어요. 잠시 후 다시 시도해 주세요', 'warn');
+        }
+
+        const btn = document.getElementById('ai-trans-btn');
+        const icon = document.getElementById('trans-icon');
+        btn.disabled = true;
+        icon.innerHTML = LOADING_ICON;
+        icon.classList.add('spin-icon');
+        
+        if (settings.useTranslation) {
+            toast('AI가 번역 및 교정 중...', 'info');
+        } else {
+            toast('AI가 한국어 대사/서술 교정 중...', 'info');
+        }
+
+        let contextText = "";
+        if (settings.useContext) {
+            contextText = await getRecentContext(settings.contextLimit || 6);
+        }
+        await refreshExchangeRate();
+
+        const lang = getTargetLang();
+        const { pattern, includesOriginal } = buildFormatInstruction();
+        const maxLength = settings.maxLength || 1000;
+
+        // 창작 강도는 프롬프트로 제어하고, Gemini 3 권장값에 맞춰 temperature는 1.0으로 유지한다.
+        const creativityLevel = ['low', 'medium', 'high'].includes(settings.creativity)
+            ? settings.creativity
+            : 'medium';
+        const temperature = 1.0;
+        const thinkingLevel = ['low', 'medium', 'high'].includes(settings.thinkingLevel)
+            ? settings.thinkingLevel
+            : 'medium';
+
+        const creativityGuideMap = {
+            low: `Stay close to the supplied wording and action order. Add only one or two directly supported sensory or behavioral details. Do not introduce a new inner association unless needed for coherence.`,
+            medium: `Expand the supplied scene with a balanced amount of facial expression, physical reaction, sensory continuity, and brief inner association. Preserve the user's core action and emotional direction while improving literary flow.`,
+            high: `Actively enrich the supplied scene with layered but relevant sensory detail, micro-actions, environmental response, and character-specific inner association. Reorganize for strong literary flow, while strictly obeying the lexical-intensity and anti-overinterpretation rules.`
+        };
+
+        const polishStyleGuide = `   [NARRATION RULES & STYLE — Apply to text in * *]\n   - BASE PRINCIPLE: Creatively expand from the user's supplied narration, actions, dialogue, recent context, and conversation profile. Added details should deepen texture and emotional resolution without making the scene colder, crueler, more hostile, more tragic, or more threatening than its established tone.\n   - Sensory Long-Breath Prose: Use fluid, long-breath descriptions with concrete sensory continuity. Keep the prose literary but readable.\n   - Light & Color: Suggest atmosphere and psychology indirectly through lighting, color, reflection, diffusion, shadow, and visual focus.\n   - Temperature & Materiality: Use temperature, texture, weight, moisture, friction, and environmental sensation to imply the present state. Do not automatically equate negative emotion with coldness, sharpness, darkness, or poison.\n   - Body & Inner Thought: Connect breath, touch, posture, pain, and small involuntary movement with realistic thoughts. Inner thought may be weighty, but it must remain specific, restrained, and proportionate to the trigger.\n   - Objective Scene Rendering: Describe environment, movement, and physical phenomena precisely. When violence or conflict appears in the source, render it dryly and objectively rather than sensationally or graphically.\n   - Complex Emotion by Implication: Do not directly label emotions when they can be shown through brief internal association, derivative thought, hesitation, gaze, posture, or unconscious action. Preserve mixed or unresolved feelings instead of forcing one dramatic conclusion.\n   - Literary Resolution Techniques: Use material transference, objective correlatives, synesthetic overlap, metonymy, emotionally paradoxical adjectives, and microscopic slow-focus details when fitting. Use them selectively rather than stacking every technique in one paragraph.\n   - Everyday Correlatives First: Prefer ordinary elements such as temperature, weather, fabric, glass, condensation, dust, sound, distance, or habitual gestures. Do not invent theatrical motifs such as dolls, games, stages, pieces, devices, hunting, possession, consumption, or contests for control unless the user's input already establishes them.\n\n   [LEXICAL INTENSITY CONTROL — CRITICAL]\n   - Preserve rich emotion and creative expansion, but keep WORD CHOICE one level calmer than the strongest plausible wording. Prefer precise, concrete language over severe evaluative language.\n   - Do not replace a discouraged word with a harsher synonym. Avoid clustering expressions equivalent to "서늘한/차갑게", "날카로운/베어내는", "짓이기다/으깨다", "긁고 내려가다", "독/비소", "잔혹한", "처참한", "섬뜩한", "지독한", "포식", or "사냥" unless the literal situation clearly requires that exact intensity.\n   - A dark or sarcastic line may remain dark or sarcastic; however, surrounding narration must not intensify it into cruelty, menace, humiliation, obsession, or despair without direct support.\n   - Do not turn ordinary displeasure, hesitation, embarrassment, or sarcasm into symbolic injury, degradation, consumption, domination, special favor, or a decisive relationship change.\n   - Do not state another character's private interpretation as fact. Frame uncertain readings as a passing possibility or leave them ambiguous.\n   - Use at most one conspicuously strong metaphor or figurative image per paragraph. Do not chain several severe images around the same reaction.\n   - Vary emotional temperature. Not every tense scene needs cold fingertips, dry breath, hardened eyes, sharpened smiles, or darkened shadows.\n   - Avoid habitual filler such as "특유의". Choose a directly observable detail instead.\n   - SILENT FINAL CHECK: Keep the newly created details and literary density, but soften any word whose intensity exceeds the actual action, dialogue, relationship, or context. Output only the finished text.\n\n   - Style Reference Sentence: "젖은 창에 번진 네온빛 아래, 차갑게 식은 손끝이 잔의 표면을 천천히 훑었고, 목 안에 걸린 마른 숨이 쉽게 가라앉지 않는 생각을 대신하고 있었다."\n`;
+
+        let sysPrompt = `You are a specialized RP writer and master editor. Process the user's input based on the rules.\n`;
+
+        // 윤문 및 번역에 함께 적용하는 콘텐츠 지침.
+        sysPrompt += `\n[CONTENT GUIDELINES — POLISHING & TRANSLATION]\n`;
+        sysPrompt += `Allow NSFW and explicit sexual content involving consenting adults. Preserve the supplied meaning, wording intensity, and established context when translating or polishing. Do not add sexual detail, coercion, or stronger emotional intensity merely because NSFW content is allowed.\n`;
+        
+        if (contextText) {
+            sysPrompt += `\n[Recent Conversation Context]\n${contextText}\n\n*CRITICAL: Use the context ONLY to understand the situation, relationship, and tone. DO NOT translate or repeat the context.*\n\n`;
+        }
+
+        sysPrompt += `[Current Room Conversation Profile / User Persona]\n${conversationProfile.name ? `Name: ${conversationProfile.name}\n` : ''}${conversationProfile.information}\nThis profile describes the user/player who wrote the draft, not the NPC. Preserve this speaker's identity and voice.\n\n`;
+
+        sysPrompt += `[CREATIVE EXPANSION LEVEL: ${creativityLevel.toUpperCase()}]\n`;
+        sysPrompt += `${creativityGuideMap[creativityLevel]}\n`;
+        sysPrompt += `This setting controls how much new descriptive material is added. It does NOT authorize stronger emotions, harsher vocabulary, unsupported motives, or a darker interpretation.\n\n`;
+
+        sysPrompt += `[RULES]\n`;
+        
+        if (settings.useTranslation) {
+            if (settings.usePolish) {
+                sysPrompt += `1. REWRITE & POLISH: Creatively rewrite and expand the user's rough Korean input while using its supplied narration, actions, dialogue, and intent as the scene's foundation. Rearrange actions (wrapped in *) and dialogue for the most natural literary flow. **Infer the character's current emotional state from the context and actively ADD fitting facial expressions, micro-expressions, physical reactions, sensory details, and brief inner associations even when they were not explicitly supplied.** Added material may deepen and clarify the scene, but must not darken the emotional direction or raise the hostility, cruelty, despair, contempt, or relationship significance beyond what the input and context support. Adapt flexibly to the current scene rather than being overly restricted by the base Persona. Expand the narration into high-quality Korean web-novel prose.\n`;
+                sysPrompt += polishStyleGuide;
+                sysPrompt += `   🚨NEGATIVE CONSTRAINT: Rich and literary does not mean harsher. Do not solve repetition by substituting a colder, sharper, more violent, poisonous, or melodramatic synonym. Keep emotional complexity high while keeping lexical intensity proportionate and grounded.\n`;
+                sysPrompt += `2. TRANSLATE: Translate the polished Korean dialogue into ${lang}. DO NOT translate the narrative (*).\n`;
+                sysPrompt += `3. FORMATTING: Output the final result. Keep narrative wrapped in *. For EVERY spoken dialogue, format it EXACTLY as: ${pattern}\n`;
+                if (includesOriginal) {
+                    sysPrompt += `   *Note: For <ORIGINAL_KOREAN_DIALOGUE>, use your newly REWRITTEN/POLISHED Korean dialogue, NOT the user's raw input.\n`;
+                }
+            } else {
+                sysPrompt += `1. NARRATIVE: DO NOT translate or modify the Korean narrative (text wrapped in * or **). Keep it EXACTLY as the original Korean text. Wrap it in *.\n`;
+                sysPrompt += `2. DIALOGUE: Translate the spoken dialogue (text outside the asterisks) to ${lang}.\n`;
+                sysPrompt += `3. FORMATTING: Output the final result. Keep narrative wrapped in *. For EVERY spoken dialogue, format it EXACTLY as: ${pattern}\n`;
+                if (!includesOriginal) {
+                    sysPrompt += `   Do NOT append the original Korean dialogue.\n`;
+                }
+            }
+        } else {
+            sysPrompt += `1. NO TRANSLATION: Keep EVERYTHING (both narrative and dialogue) in KOREAN. Do not translate to foreign languages.\n`;
+            if (settings.usePolish) {
+                sysPrompt += `2. REWRITE & POLISH: Creatively rewrite and expand the user's rough Korean input while using its supplied narration, actions, dialogue, and intent as the scene's foundation. Rearrange them for a natural literary flow. **Infer the character's current emotional state from context and actively ADD fitting facial expressions, micro-expressions, physical reactions, sensory details, and brief inner associations even when they were not explicitly supplied.** Added material may deepen and clarify the scene, but must not darken it or raise hostility, cruelty, despair, contempt, or relationship significance beyond what the input and context support. Expand the narration into high-quality Korean web-novel prose.\n`;
+                sysPrompt += polishStyleGuide;
+                sysPrompt += `   🚨NEGATIVE CONSTRAINT: Rich and literary does not mean harsher. Do not solve repetition by substituting a colder, sharper, more violent, poisonous, or melodramatic synonym. Keep emotional complexity high while keeping lexical intensity proportionate and grounded.\n`;
+            } else {
+                sysPrompt += `2. FIX TONE: Fix the spoken dialogue's tone to match the current conversation profile. Keep the narrative (*) as it is without modifying it.\n`;
+            }
+            sysPrompt += `3. FORMATTING: Output the final Korean text directly. Keep the narrative wrapped in *. DO NOT use any translation format. Just output the natural text.\n`;
+        }
+
+        sysPrompt += `4. TYPOGRAPHICAL EMPHASIS (INTONATION): Pay close attention to elongated words, repeated vowels/consonants, or stuttering in the user's raw input (e.g., "좀 더더어어어ㅓ어엉", "안녀어어어엉"). You MUST replicate this exact same typographical emphasis, length, and emotional intensity in your final dialogue (e.g., "Mooooorooooeee", "Heeellloooo"). Do not clean up emotional elongation.\n`;
+
+        sysPrompt += `5. LENGTH LIMIT: 🚨CRITICAL🚨 The TOTAL length of your final output MUST NOT exceed ${maxLength} characters.\n`;
+
+        sysPrompt += `\n[EXAMPLES]\n`;
+        if (settings.useTranslation) {
+            sysPrompt += `Example Raw Input: 돈을 보낼리가 없잖아요오오오. 대충 대답한다 어디로 가실건데요?\n`;
+            sysPrompt += `Example Output: *창에 번진 빛이 잔 표면에서 느리게 흔들렸다. 손끝으로 맺힌 물기를 한 번 훑은 뒤, 아직 정리되지 않은 생각을 고르듯 잠시 뜸을 들였다.* There's no way he'd send the money straight awayyyyy. (돈을 당장 보내실 리가 없잖아요오오오.) *잔을 내려놓고 상대의 얼굴을 가만히 살폈다.* But where exactly are we going? (근데... 어디로 가실 건데요?)\n`;
+        } else {
+            sysPrompt += `Example Raw Input: 아니이이이! 대충 화낸다 그게 무슨 소리야아아아!\n`;
+            sysPrompt += `Example Output: *잡고 있던 물건을 내려놓는 손이 잠깐 엇박자를 냈다. 눈을 크게 뜬 채 상대의 얼굴을 확인하고서야 목소리가 한 박자 늦게 높아졌다.* 아니이이이! 그게 도대체 무슨 소리야아아아!\n`;
+        }
+
+        try {
+            let translatedText = "";
+            let usageEntry = null;
+            const requestProvider = settings.provider;
+            const requestModel = settings.model;
+            const safetySettings = [
+                { category: "HARM_CATEGORY_HATE_SPEECH", threshold: "BLOCK_NONE" },
+                { category: "HARM_CATEGORY_SEXUALLY_EXPLICIT", threshold: "BLOCK_NONE" },
+                { category: "HARM_CATEGORY_HARASSMENT", threshold: "BLOCK_NONE" },
+                { category: "HARM_CATEGORY_DANGEROUS_CONTENT", threshold: "BLOCK_NONE" }
+            ];
+
+            if (settings.provider === 'firebase') {
+                const config = parseVertexContent(settings.firebaseConfig);
+                if (!config) throw new Error("Firebase 스크립트 형식이 올바르지 않습니다.");
+
+                const { initializeApp, deleteApp } = await import("https://www.gstatic.com/firebasejs/12.8.0/firebase-app.js");
+                const { getAI, getGenerativeModel, VertexAIBackend, HarmBlockThreshold, HarmCategory } = await import("https://www.gstatic.com/firebasejs/12.8.0/firebase-ai.js");
+
+                let app;
+                try { app = initializeApp(config, "trans-ai-" + Date.now()); } catch(e) { throw new Error("Firebase 초기화 실패: " + e.message); }
+
+                try {
+                    await configureFirebaseAppCheck(app, config);
+                    const ai = getAI(app, { backend: new VertexAIBackend('global') });
+                    const fSafety = [
+                        { category: HarmCategory.HARM_CATEGORY_HATE_SPEECH, threshold: HarmBlockThreshold.OFF },
+                        { category: HarmCategory.HARM_CATEGORY_SEXUALLY_EXPLICIT, threshold: HarmBlockThreshold.OFF },
+                        { category: HarmCategory.HARM_CATEGORY_HARASSMENT, threshold: HarmBlockThreshold.OFF },
+                        { category: HarmCategory.HARM_CATEGORY_DANGEROUS_CONTENT, threshold: HarmBlockThreshold.OFF }
+                    ];
+
+                    const model = getGenerativeModel(ai, { 
+                        model: settings.model, 
+                        systemInstruction: sysPrompt, 
+                        safetySettings: fSafety,
+                        generationConfig: {
+                            temperature: temperature,
+                            thinkingConfig: { thinkingLevel: thinkingLevel }
+                        }
+                    });
+                    const result = await model.generateContent(rawText);
+                    const response = await result.response;
+                    usageEntry = recordUsage(response.usageMetadata, requestProvider, requestModel);
+                    translatedText = response.text().trim();
+                } finally {
+                    await deleteApp(app).catch(() => {});
+                }
+
+            } else {
+                const payloadData = {
+                    system_instruction: { parts: [{ text: sysPrompt }] },
+                    contents: [{ parts: [{ text: rawText }] }],
+                    safetySettings: safetySettings,
+                    generationConfig: {
+                        temperature: temperature,
+                        thinkingConfig: { thinkingLevel: thinkingLevel }
+                    }
+                };
+
+                translatedText = await new Promise((resolve, reject) => {
+                    GM_xmlhttpRequest({
+                        method: "POST",
+                        url: `https://generativelanguage.googleapis.com/v1beta/models/${settings.model}:generateContent?key=${settings.apiKey}`,
+                        headers: { "Content-Type": "application/json" },
+                        data: JSON.stringify(payloadData),
+                        onload: (res) => {
+                            try {
+                                const data = JSON.parse(res.responseText);
+                                usageEntry = recordUsage(data.usageMetadata, requestProvider, requestModel);
+                                if (data.promptFeedback && data.promptFeedback.blockReason) throw new Error(`필터 차단됨`);
+                                if (data.candidates && data.candidates.length > 0) {
+                                    const cand = data.candidates[0];
+                                    if (cand.finishReason === "SAFETY") throw new Error("안전 필터 차단됨");
+                                    if (!cand.content || !cand.content.parts || cand.content.parts.length === 0) throw new Error("빈 텍스트 반환됨");
+                                    const finalText = cand.content.parts
+                                        .filter(part => part.text && !part.thought)
+                                        .map(part => part.text)
+                                        .join('')
+                                        .trim();
+                                    if (!finalText) throw new Error("최종 응답 텍스트 없음");
+                                    resolve(finalText);
+                                } else if (data.error) { throw new Error(`${data.error.message}`); } 
+                                else { throw new Error("결과값 없음"); }
+                            } catch (e) {
+                                if (e instanceof SyntaxError) reject(new Error('모델명/키 오류')); else reject(e);
+                            }
+                        },
+                        onerror: () => reject(new Error('네트워크 오류 (API/인터넷 확인)'))
+                    });
+                });
+            }
+
+            setReactValue(inputEl, translatedText);
+            const usageSuffix = usageEntry ? ` · ${formatTokens(usageEntry.total)}토큰` : ' · 사용량 정보 없음';
+            toast((settings.useTranslation ? '번역 완료' : '한국어 문장 교정 완료') + usageSuffix, 'success');
+
+        } catch (error) {
+            toast(`에러: ${error.message}`, 'error');
+        } finally {
+            btn.disabled = false;
+            icon.innerHTML = TRANSLATE_ICON;
+            icon.classList.remove('spin-icon');
+        }
+    }
+
+    // ===================================================================================
+    // [UI 자동 주입 로직]
+    // ===================================================================================
+    function findSendContainer() {
+        const toolbar = document.querySelector('.flex.items-center.space-x-2');
+        return toolbar || null;
+    }
+
+    function injectButtons() {
+        const container = findSendContainer();
+        if (!container) return;
+
+        let wrapper = document.getElementById('ai-trans-inline-group');
+        if (!wrapper || !wrapper.isConnected) {
+            wrapper = document.createElement('div');
+            wrapper.id = 'ai-trans-inline-group';
+            wrapper.style.marginRight = '4px';
+
+            wrapper.innerHTML = `
+                <button type="button" id="ai-trans-btn" class="trans-action-btn" title="대화 프로필 맞춤 번역/교정" aria-label="대화 프로필 맞춤 번역/교정"><span id="trans-icon">${TRANSLATE_ICON}</span></button>
+                <button type="button" id="ai-trans-cfg-btn" class="trans-setting-btn" title="설정" aria-label="설정">${SETTINGS_ICON}</button>
+            `;
+
+            container.insertBefore(wrapper, container.firstChild);
+
+            wrapper.querySelector('#ai-trans-btn').onclick = executeTranslation;
+            wrapper.querySelector('#ai-trans-cfg-btn').onclick = () => {
+                const p = document.getElementById('ai-trans-panel');
+                p.style.display = p.style.display === 'flex' ? 'none' : 'flex';
+                p.aitFitToViewport?.();
+                applyAitTheme();
+                if (p.style.display === 'flex') syncCurrentProfile(true);
+            };
+            renderUsage();
+        }
+        applyAitTheme();
+        if (activeProfile.chatId !== getCurrentChatId()) syncCurrentProfile();
+    }
+
+    UI.init();
+    injectButtons();
+    setInterval(injectButtons, 1000);
+
+})();
