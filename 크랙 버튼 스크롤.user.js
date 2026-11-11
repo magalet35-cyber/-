@@ -1,9 +1,14 @@
 // ==UserScript==
 // @name         Crack Button Scroll — 크랙 입력창 버튼 가로 스크롤
 // @namespace    crack-button-scroll
-// @version      1.0.0
-// @description  입력창 버튼이 넘치면 가로 스크롤. 버튼 크기·배치 안정화, 전송 버튼 고정. 화면 크기 제한 없음.
-// @match        https://crack.wrtn.ai/*
+// @version      1.3.0
+// @updateURL    https://raw.githubusercontent.com/magalet35-cyber/-/main/%ED%81%AC%EB%9E%99%20%EB%B2%84%ED%8A%BC%20%EC%8A%A4%ED%81%AC%EB%A1%A4.user.js
+// @downloadURL  https://raw.githubusercontent.com/magalet35-cyber/-/main/%ED%81%AC%EB%9E%99%20%EB%B2%84%ED%8A%BC%20%EC%8A%A4%ED%81%AC%EB%A1%A4.user.js
+// @description  새 UI 버튼 줄을 손가락으로 직접 좌우 이동. AI 변경 포함, 전송 버튼 고정.
+// @match        https://wrtn.ai/*
+// @match        https://*.wrtn.ai/*
+// @match        https://crack.ai/*
+// @match        https://*.crack.ai/*
 // @run-at       document-idle
 // @grant        none
 // @noframes
@@ -22,10 +27,11 @@
   'use strict';
 
   const INSTANCE = '__crackButtonScrollV1';
-  if (window[INSTANCE]) return;
+  if (window[INSTANCE]?.version === '1.3.0') return;
+  window[INSTANCE]?.destroy?.();
 
   const EDITOR = '.__chat_input_textarea,textarea,[contenteditable="true"],[role="textbox"],[data-lexical-editor="true"],.ProseMirror';
-  const CONTROL = 'button,[role="button"],input[type="button"],input[type="submit"]';
+  const CONTROL = 'button,[role="button"],input[type="button"],input[type="submit"],[aria-haspopup="menu"],[aria-haspopup="listbox"],[aria-haspopup="dialog"]';
   const POPUP = '[role="dialog"],[role="menu"],[role="listbox"],[role="tooltip"],[popover],[aria-modal="true"],[data-radix-popper-content-wrapper]';
   const EXCLUDE = `${POPUP},#wish-rp-root,#wish-rp-quick,#rpcm-ai-backdrop,#rpcm-ai-settings-backdrop,#cwa-host,#ai-trans-panel,#crack-ext-toolbar-fallback`;
   const STYLE_ID = 'crack-button-scroll-style-v1';
@@ -39,6 +45,12 @@
   let frame = 0;
   let timer = 0;
   let destroyed = false;
+  let notice = null;
+  let noticed = false;
+  let noticeTimer = 0;
+  let touchDrag = null;
+  let blockedClick = null;
+
   const css = `
     [data-cbs-role="row"] {
       display:flex !important;
@@ -54,7 +66,7 @@
       overflow-y:hidden !important;
       overscroll-behavior-x:contain;
       -webkit-overflow-scrolling:touch;
-      touch-action:pan-x pinch-zoom;
+      touch-action:pan-y pinch-zoom !important;
       scrollbar-width:thin;
       scrollbar-color:rgba(128,128,128,.35) transparent;
       scroll-behavior:auto !important;
@@ -62,11 +74,13 @@
       isolation:isolate;
       gap:6px !important;
       padding-block:3px !important;
+      padding-inline-end:6px !important;
+      direction:ltr !important;
     }
     [data-cbs-role="row"]::-webkit-scrollbar { height:3px; }
     [data-cbs-role="row"]::-webkit-scrollbar-track { background:transparent; }
     [data-cbs-role="row"]::-webkit-scrollbar-thumb { background:rgba(128,128,128,.35); border-radius:6px; }
-    [data-cbs-role="item"], [data-cbs-role="group"], [data-cbs-role="pin"] {
+    [data-cbs-role="item"], [data-cbs-role="group"], [data-cbs-role="pin"], [data-cbs-role="spacer"] {
       flex:0 0 auto !important;
       flex-shrink:0 !important;
       order:var(--cbs-order,0) !important;
@@ -74,9 +88,17 @@
       inset:auto !important;
       position:relative !important;
       margin-inline:0 !important;
+      transform:none !important;
+      translate:none !important;
     }
     [data-cbs-role="item"] {
-      touch-action:pan-x pinch-zoom !important;
+      touch-action:pan-y pinch-zoom !important;
+    }
+    [data-cbs-role="item"]:not(button):not(input):not([role="button"]) {
+      width:max-content !important;
+      min-width:max-content !important;
+      max-width:none !important;
+      overflow:visible !important;
     }
     :where([data-cbs-role="group"]) { display:flex; }
     [data-cbs-role="group"] {
@@ -89,7 +111,21 @@
       max-width:none !important;
       overflow:visible !important;
       gap:6px !important;
-      touch-action:pan-x pinch-zoom !important;
+      touch-action:pan-y pinch-zoom !important;
+    }
+    [data-cbs-role="contents"] {
+      display:contents !important;
+    }
+    [data-cbs-model="true"] {
+      flex:0 0 auto !important;
+      width:max-content !important;
+      min-width:max-content !important;
+      max-width:none !important;
+    }
+    [data-cbs-model="true"] > span {
+      flex-shrink:0 !important;
+      min-width:max-content !important;
+      max-width:none !important;
     }
     [data-cbs-role="pin"] {
       position:sticky !important;
@@ -173,18 +209,16 @@
   }
 
   function sendScore(button) {
-    if (/추천\s*답변|recommend|wish|번역|translate|어시스턴트/i.test(hint(button)+' '+button.id)) return 0;
-    if (/전송|메시지\s*보내기|send\s*(message)?|응답\s*중지|생성\s*중지|중지|stop\s*(generat|respond)/i.test(hint(button))) return 100;
-    if (button.matches('input[type="submit"],button[type="submit"]')) return 70;
+    if (button.hasAttribute('data-crack-ui-empty-send-guard') || button.hasAttribute('data-crack-ui-empty-send-blocked')) return 120;
+    const label = hint(button)+' '+button.id+' '+(button.textContent || '').trim();
+    if (/추천\s*답변|recommend|wish|번역|translate|어시스턴트|모델|model|AI\s*(변경|선택)|채팅\s*AI|Gemini|Claude|GPT|Opus|Sonnet|페이블|하이퍼/i.test(label)
+      || button.matches('[aria-haspopup]')) return 0;
+    if (/전송|메시지\s*보내기|\bsend\b|응답\s*중지|생성\s*중지|^중지$|stop\s*(generat|respond)/i.test(hint(button))) return 100;
     const paths = [...button.querySelectorAll('svg path')].map(p => p.getAttribute('d') || '').join(' ');
     const primary = /bg-primary|text-primary-foreground/.test(String(button.className));
     if (primary && /M18\.77|M18\.38 12\.88|10\.27-5\.93|11\.86a1 1|6\.62 6\.63/.test(paths)) return 90;
-    // aria-label이 없는 새 UI: 색상 있는 우측 아이콘 버튼만 보조 후보로 사용.
-    const bg = getComputedStyle(button).backgroundColor;
-    const rgb = bg.match(/rgba?\(\s*(\d+)[, ]+\s*(\d+)[, ]+\s*(\d+)/);
-    const colored = rgb && Math.max(...rgb.slice(1).map(Number))-Math.min(...rgb.slice(1).map(Number)) > 65;
-    const text = (button.textContent || '').trim();
-    return (primary || colored) && button.querySelector('svg') && !text && !button.id ? 35 : 0;
+    // 색상/submit 속성만으로는 번역·AI 선택 버튼과 구분할 수 없다.
+    return 0;
   }
 
   function branch(parent,node) {
@@ -194,6 +228,8 @@
   }
 
   function findRow(input) {
+    const exact = newLayout(input);
+    if (exact) return exact.row;
     const ir = input.getBoundingClientRect();
     const candidates = new Set();
     let scope = input.parentElement;
@@ -227,6 +263,41 @@
       if (score > bestScore) { best=row; bestScore=score; }
     }
     return best;
+  }
+
+  // 진단으로 확인한 구조: 입력 상자 → 패딩 상자 → 좌우 flex 행.
+  // 모델 선택+위시코어+전송이 있는 오른쪽 묶음을 행과 구분해서 잡는다.
+  function newLayout(input) {
+    let shell=input.parentElement;
+    for(let depth=0;shell && depth<4;depth++,shell=shell.parentElement) {
+      for(const area of shell.children) {
+        if(area===input || area.contains(input) || area.matches(POPUP)) continue;
+        for(const row of [area,...area.children]) {
+          if(!row.classList.contains('flex') || !row.classList.contains('justify-between') || row.contains(input)) continue;
+          const groups=[...row.children].filter(el=>el instanceof HTMLElement && (visible(el) || el.getAttribute(ROLE)==='contents'));
+          const left=groups.find(el=>el.classList.contains('shrink-0') && el.querySelector(CONTROL));
+          const right=groups.find(el=>el!==left && el.classList.contains('min-w-0') && el.querySelector(CONTROL));
+          if(!left || !right) continue;
+          const model=[...right.children].find(el=>el.matches(CONTROL) && el.hasAttribute('aria-haspopup'));
+          if(!model) continue;
+          const send=[...right.children].filter(el=>el.matches(CONTROL) && el!==model &&
+            (sendScore(el)>=90 || el.classList.contains('bg-primary') && el.classList.contains('text-primary-foreground'))).pop();
+          return {row,left,right,model,send};
+        }
+      }
+    }
+    return null;
+  }
+
+  function applicationNotice() {
+    if(noticed) return;
+    noticed=true;
+    notice=document.createElement('div');
+    notice.textContent='버튼 스크롤 적용됨 · 좌우로 밀어보세요';
+    notice.setAttribute('role','status');
+    notice.style.cssText='position:fixed;left:50%;top:90px;transform:translateX(-50%);max-width:90vw;padding:8px 12px;border-radius:9px;background:#222;color:#fff;font:12px sans-serif;z-index:2147483647;pointer-events:none;white-space:nowrap;';
+    (document.body || document.documentElement).appendChild(notice);
+    noticeTimer=setTimeout(()=>{notice?.remove();notice=null;},4000);
   }
 
   function safeWidth(row,input) {
@@ -281,15 +352,61 @@
       if (!buttons.length || child.matches(EDITOR) || child.querySelector(EDITOR)) continue;
       // 실제 버튼 상자만 표시한다. 팝업/배지/아이콘은 수정하지 않는다.
       keep.add(child);
-      attribute(child,ROLE,child===pinned ? 'pin' : isControl ? 'item' : 'group');
+      // 모델명+화살표 등 하나의 선택 위젯은 내부 레이아웃을 유지한다.
+      const grouped = !isControl && buttons.length > 1;
+      attribute(child,ROLE,child===pinned ? 'pin' : grouped ? 'group' : 'item');
       variable(child,'--cbs-order',String(stableOrder(parent,child)));
-      if (!isControl) markChildren(child,keep,null,depth+1);
+      if (grouped) markChildren(child,keep,null,depth+1);
     }
   }
 
   function listen(el,type,fn,options) {
     el.addEventListener(type,fn,options);
     (bound.get(el) || listeners).push(()=>el.removeEventListener(type,fn,options));
+  }
+
+  function touchStart(event) {
+    touchDrag=null;
+    blockedClick=null;
+    const row=currentRow;
+    const target=event.target;
+    if(!row || !(target instanceof Element) || !row.contains(target) || target.closest(POPUP)
+      || event.touches.length!==1 || row.scrollWidth<=row.clientWidth+2) return;
+    const point=event.touches[0];
+    touchDrag={row,id:point.identifier,x:point.clientX,y:point.clientY,scroll:row.scrollLeft,axis:null,moved:false};
+  }
+
+  function touchMove(event) {
+    const drag=touchDrag;
+    if(!drag) return;
+    if(event.touches.length!==1 || !drag.row.isConnected || drag.row!==currentRow) {touchDrag=null;return;}
+    const point=[...event.touches].find(p=>p.identifier===drag.id);
+    if(!point) return;
+    const dx=point.clientX-drag.x,dy=point.clientY-drag.y;
+    if(!drag.axis) {
+      if(Math.max(Math.abs(dx),Math.abs(dy))<7) return;
+      if(Math.abs(dy)>Math.abs(dx)) {touchDrag=null;return;}
+      drag.axis='x';
+    }
+    drag.row.scrollLeft=Math.max(0,Math.min(drag.row.scrollWidth-drag.row.clientWidth,drag.scroll-dx));
+    drag.moved=true;
+    // 기본 스크롤 또는 페이지의 가로 제스처와 중복 실행하지 않는다.
+    if(event.cancelable) event.preventDefault();
+    event.stopPropagation();
+  }
+
+  function touchEnd() {
+    if(touchDrag?.moved) blockedClick={row:touchDrag.row,until:Date.now()+650};
+    touchDrag=null;
+  }
+
+  function touchClick(event) {
+    const block=blockedClick;
+    if(!block) return;
+    if(Date.now()>block.until) {blockedClick=null;return;}
+    if(event.detail===0 || !(event.target instanceof Element) || !block.row.contains(event.target)) return;
+    // 밀던 손가락을 뗄 때 버튼(특히 전송)이 눌리는 것을 막는다.
+    event.preventDefault();event.stopImmediatePropagation();blockedClick=null;
   }
 
   function bindRow(row) {
@@ -337,8 +454,9 @@
       bound.delete(old);
     }
     if (row) {
+      const layout=newLayout(input);
       const buttons=controls(row);
-      const send=buttons.map(b=>({button:b,score:sendScore(b)})).filter(b=>b.score>0)
+      const send=buttons.map(b=>({button:b,score:sendScore(b)})).filter(b=>b.score>=90)
         .sort((a,b)=>b.score-a.score || b.button.getBoundingClientRect().right-a.button.getBoundingClientRect().right)[0]?.button;
       const sendBranch=send ? branch(row,send) : null;
       // send가 복잡한 도구 상자 안에 있으면 그 상자 전체를 고정하지 않는다.
@@ -348,11 +466,27 @@
       variable(row,'--cbs-limit',safeWidth(row,input)+'px');
       variable(row,'--cbs-surface',surface(row));
       markChildren(row,keep,pin);
+      if(layout?.row===row) {
+        // display:contents로 오른쪽 묶음의 경계만 없앤다. 버튼 DOM/이벤트는 그대로 둔다.
+        keep.add(layout.right);
+        attribute(layout.right,ROLE,'contents');
+        markChildren(layout.right,keep,layout.send);
+        attribute(layout.model,'data-cbs-model','true');
+        for(const child of layout.right.children) {
+          if(!(child instanceof HTMLElement) || !visible(child) || child.matches(POPUP)) continue;
+          keep.add(child);
+          const nested=controls(child).length;
+          attribute(child,ROLE,child===layout.send ? 'pin' : child.matches(CONTROL) ? 'item' : nested>1 ? 'group' : nested ? 'item' : 'spacer');
+          variable(child,'--cbs-order',String(stableOrder(row,child)));
+        }
+      }
       if (!row.hasAttribute('tabindex')) attribute(row,'tabindex','0');
       bindRow(row);
+      applicationNotice();
     }
     for (const el of [...touched.keys()]) if (!keep.has(el)) restore(el);
   }
+
   function schedule() {
     if (destroyed || timer || frame) return;
     timer=setTimeout(()=>{
@@ -366,7 +500,7 @@
       const target=record.target;
       if (!(target instanceof Element) || target.id===STYLE_ID || target.closest(EXCLUDE)) return false;
       if (currentRow && (target===currentRow || currentRow.contains(target))) return true;
-      if (record.type==='attributes') return target===currentInput;
+      if (record.type==='attributes') return target===currentInput || !!target.querySelector(EDITOR);
       return [...record.addedNodes,...record.removedNodes].some(node=>node instanceof Element &&
         (node===currentInput || node===currentRow || node.matches(EDITOR+','+CONTROL) || node.querySelector(EDITOR+','+CONTROL)));
     })) schedule();
@@ -378,14 +512,22 @@
   (document.head || document.documentElement).appendChild(style);
   observer.observe(document.documentElement,{subtree:true,childList:true,attributes:true,attributeFilter:['class','hidden','aria-hidden','aria-label']});
   listen(window,'resize',schedule,{passive:true});
+  listen(document,'touchstart',touchStart,{capture:true,passive:true});
+  listen(document,'touchmove',touchMove,{capture:true,passive:false});
+  listen(document,'touchend',touchEnd,{capture:true,passive:true});
+  listen(document,'touchcancel',touchEnd,{capture:true,passive:true});
+  listen(document,'click',touchClick,{capture:true});
   if (window.visualViewport) listen(window.visualViewport,'resize',schedule,{passive:true});
   // SPA 화면 전환, 뒤늦게 실행되는 확프, style만 바꾸는 확프를 위한 저빈도 보조 확인.
   const poll=setInterval(()=>{if(!document.hidden)schedule();},1800);
-  window[INSTANCE]={version:'1.0.0',refresh:schedule,destroy(){
+  window[INSTANCE]={version:'1.3.0',refresh:schedule,destroy(){
     destroyed=true;
     observer.disconnect();
     clearInterval(poll);
     clearTimeout(timer);
+    clearTimeout(noticeTimer);
+    notice?.remove();
+    touchDrag=null;blockedClick=null;
     cancelAnimationFrame(frame);
     listeners.forEach(remove=>remove());
     for (const removers of bound.values()) removers.forEach(remove=>remove());
